@@ -1,0 +1,28 @@
+#!/bin/sh
+# safeai-run COMMAND [ARGS...] - run COMMAND as the agent user, in the current folder.
+# Used by `safeai` (the agent's terminal) and, after `safeai settings set vscode agent`, by VS Code (Claude Code's
+# claudeProcessWrapper passes the claude binary as COMMAND; Codex goes through
+# safeai-codex). A folder closed to the agent is refused, never run as you.
+AGENT=$(sed -n 's/^AGENT=//p' /etc/safeai.conf 2>/dev/null); AGENT=${AGENT:-aiagent}
+cwd=$(pwd -P)
+
+if ! sudo -n -u "$AGENT" test -r . -a -x .; then
+    echo "safeai: $cwd is closed to the agent; open it first: safeai open $cwd" >&2
+    exit 1
+fi
+AGENT_HOME=$(getent passwd "$AGENT" | cut -d: -f6)
+exec sudo -n -u "$AGENT" --preserve-env -- /bin/sh -c '
+umask 002
+home=$0  # $0 is the agent home, "$@" the command
+# AppArmor profile if installed; if it is installed but not loaded, this fails closed
+[ -e /etc/apparmor.d/safeai-agent ] && set -- /usr/bin/aa-exec -p safeai-agent -- "$@"
+# none of your session or secrets: sockets, askpass helpers, tokens, keys
+for v in $(env | sed -n "s/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p"); do
+    case "$v" in
+        *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*API_KEY*|*_KEY|GIT_*|GH_*|GITHUB_*|AWS_*|AZURE_*|GOOGLE_*|\
+        OPENAI_*|ANTHROPIC_*|SSH_*|GPG_*|GNUPGHOME|VSCODE_GIT_*|VSCODE_IPC_HOOK*|XDG_RUNTIME_DIR|\
+        DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|DISPLAY|XAUTHORITY|BROWSER) unset "$v" ;;
+    esac
+done
+exec env HOME="$home" USER="$(id -un)" LOGNAME="$(id -un)" PATH="$home/.local/bin:$home/bin:$PATH" "$@"
+' "$AGENT_HOME" "$@"

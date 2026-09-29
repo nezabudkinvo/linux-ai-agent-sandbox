@@ -1,0 +1,24 @@
+# safeai: processes of the AI agent user. Everything is allowed except files with
+# secret-looking names (.env and friends) outside /tmp and /dev/shm, which are
+# refused at open time. mount and change_profile are not allowed.
+abi <abi/@ABI@>,
+include <tunables/global>
+
+@{SAFEAI_DENY}=/home /root /etc /srv /opt /usr /mnt /media /snap /var /data /boot /run /lib /lib64 /bin /sbin
+@{SECRET}=.env .env.local .env.*.local .env.prod .env.production .env.dev .env.development .env.stage .env.staging .env.test .env.testing *.env
+
+profile safeai-agent flags=(attach_disconnected,mediate_deleted) {
+  /{,**} mrwlkix,
+  network,
+  capability,
+  signal,
+  ptrace,
+  unix,
+  dbus,
+  @EXTRA@
+
+  # "audit": refusals go to the audit log (safeai log)
+  audit deny @{SAFEAI_DENY}/**/@{SECRET} mrwlkx,
+  # a hard link to a secret under another name
+  audit deny link /** -> @{SAFEAI_DENY}/**/@{SECRET},
+}

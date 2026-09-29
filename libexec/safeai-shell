@@ -1,0 +1,6 @@
+#!/bin/bash
+# Login shell of the agent user: everything it starts over ssh runs in the AppArmor profile.
+case "$0" in
+    -*) exec /usr/bin/aa-exec -p safeai-agent -- /bin/bash -l "$@" ;;
+    *) exec /usr/bin/aa-exec -p safeai-agent -- /bin/bash "$@" ;;
+esac

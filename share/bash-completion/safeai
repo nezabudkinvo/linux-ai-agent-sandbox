@@ -1,0 +1,23 @@
+# bash completion for safeai; install.sh puts it into
+# /usr/local/share/bash-completion/completions/ (loaded by the bash-completion package).
+_safeai() {
+    local cur=${COMP_WORDS[COMP_CWORD]} words
+    case "$COMP_CWORD:${COMP_WORDS[1]}" in
+        1:*) words="status settings ls open read close check log setup update --version --help" ;;
+        2:settings) words="set" ;;
+        3:settings) words="mode vscode emblems notifications" ;;
+        4:settings)
+            case "${COMP_WORDS[3]}" in
+                mode) words="relaxed strict" ;; vscode) words="agent you" ;;
+                emblems | notifications) words="on off" ;;
+            esac ;;
+        2:check) words="--fix" ;;
+        2:log) words="all" ;;
+        *:open | *:read | *:close | *:ls) return ;;  # paths: the default completion
+        *) words="" ;;
+    esac
+    compopt +o default 2>/dev/null  # only these words here, not file names
+    # shellcheck disable=SC2207
+    COMPREPLY=($(compgen -W "$words" -- "$cur"))
+}
+complete -o default -F _safeai safeai

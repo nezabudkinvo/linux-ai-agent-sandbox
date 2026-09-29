@@ -1,0 +1,1275 @@
+#!/usr/bin/python3 -I
+"""safeai - keep an AI agent's Linux user out of your private files.
+
+The agent (Claude Code, Codex, ...) runs as a separate user. You decide, per
+folder or file, what it may do; the kernel enforces it with ACLs.
+
+    safeai                          a terminal as the agent, in this folder (offers to open
+                                      it first); run claude, codex, ... there, exit to leave.
+                                      Plain claude in your own terminal stays yours
+    safeai status                   mode and every rule you set
+    safeai settings                 show the settings and change them in a menu; there, r drops
+                                      all your rules and goes back to the mode's defaults (asks first)
+    safeai settings set NAME VALUE  change one without the menu (for scripts):
+                                      mode relaxed|strict - for everything you did not set:
+                                        relaxed - your folders open, settings and programs
+                                                  read-only (the default)
+                                        strict  - the agent sees nothing in your home
+                                      vscode agent|you - who runs Claude Code and Codex in VS Code
+                                      emblems on|off - closed / read-only emblems in Files
+                                      notifications on|off - Files tells you about problems
+    safeai ls [PATH]                what the agent can do with each entry (asks the kernel)
+    safeai open PATH...             the agent may read and write
+                                      (for settings and places that run code as you it
+                                      asks first, default no; --force skips the question)
+    safeai read PATH...             the agent may read, not change
+    safeai close PATH...            the agent can neither read nor enter
+    safeai check [--fix]            verify (and repair) access, close new .env files
+    safeai log [HOURS|all]          what the agent tried and was refused (default: 24 h)
+    safeai setup                    apply all rules again
+    safeai update                   download the latest version and install it (asks for sudo)
+    safeai --version
+
+Secret stores and .env files stay closed, places that run code as you (.git/hooks,
+.vscode, ...) read-only, in both modes. Run as yourself, not root. Your lists are
+in ~/.config/safeai.
+"""
+import datetime
+import glob
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def system_conf(key, default):
+    """Value from /etc/safeai.conf (root-owned, written by install.sh)."""
+    try:
+        with open("/etc/safeai.conf") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == key and v:
+                    return v
+    except OSError:
+        pass
+    return default
+
+
+AGENT = system_conf("AGENT", "aiagent")
+_o, _a = pwd.getpwuid(os.getuid()), pwd.getpwnam(AGENT)
+OWNER, OWNER_UID = _o.pw_name, _o.pw_uid
+HOME = os.environ.get("SAFEAI_HOME") or _o.pw_dir  # override: tests only
+AGENT_UID, AGENT_GID = _a.pw_uid, _a.pw_gid
+CONF = os.environ.get("SAFEAI_CONF", f"{HOME}/.config/safeai")
+QUARANTINE = f"{HOME}/.local/share/safeai-quarantine"
+O_PATH = getattr(os, "O_PATH", 0o10000000)
+
+ENV_NAME = re.compile(r"^(\.env(\..+)?|.+\.env)$")
+ENV_SAMPLE = re.compile(r"[.-](example|sample|template|dist|defaults?)(\.env)?$", re.I)
+# Things your tools execute as you: read-only for the agent even inside open folders.
+EXEC_NAMES = (".vscode", ".envrc", ".claude", ".codex", ".mcp.json")
+SKIP_ENV = ("node_modules", ".git", ".venv", "venv", "__pycache__")
+SKIP_TOP = (".cache", ".ssh", ".vscode-server", ".vscode")
+
+# relaxed mode: every visible folder in ~ is open, except
+# programs and environments that run as you - those are read-only:
+NOT_WORK = ("bin", "snap", "go", "programs", "Applications", "anaconda3", "miniconda3", "miniforge3",
+            "mambaforge", "venv", ".venv")
+# Places where programs keep logins and keys. Many are 700 anyway; these are
+# closed explicitly in case they are not.
+SECRETS = (".ssh", ".gnupg", ".password-store", ".pki", ".netrc", ".git-credentials", ".pgpass",
+           ".npmrc", ".pypirc", ".docker", ".kube", ".aws", ".azure", ".config/gcloud", ".config/gh",
+           ".config/git", ".local/share/keyrings", ".mozilla", ".thunderbird", ".config/google-chrome",
+           ".config/chromium", ".config/BraveSoftware", ".config/Code", ".config/discord", ".config/evolution",
+           ".config/goa-1.0", ".claude", ".claude.json", ".codex", ".gemini", ".codeium", ".copilot", ".var",
+           ".vnc", ".cargo/credentials.toml", ".local/share/safeai-quarantine")
+SEEN = f"{CONF}/seen-dirs.json"
+
+
+def under(p, root):
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+
+def agent_made(st):
+    # safeai-guard hands agent files to the owner and marks them with the agent's group
+    return st.st_uid == AGENT_UID or (st.st_uid == OWNER_UID and st.st_gid == AGENT_GID)
+
+
+def is_env(p):
+    name = os.path.basename(p)
+    return bool(ENV_NAME.match(name)) and not ENV_SAMPLE.search(name)
+
+
+def exec_place(p):
+    parts = p.split("/")
+    for i, name in enumerate(parts):
+        if name in EXEC_NAMES or name.endswith(".desktop"):
+            return True
+        if name == ".git":
+            return True
+    return False
+
+
+def git_dir_of(p):
+    """Path of the .git directory that contains p (or is p itself), else None."""
+    parts = p.split("/")
+    for i, name in enumerate(parts):
+        if name == ".git":
+            return "/".join(parts[:i + 1])
+    return None
+
+
+_owns = {}
+
+
+def agent_owns(path):
+    """True if path belongs to the agent (a repo the agent created itself). Cached."""
+    if path not in _owns:
+        try:
+            _owns[path] = os.stat(path).st_uid == AGENT_UID
+        except OSError:
+            _owns[path] = False
+    return _owns[path]
+
+
+def lines(name):
+    try:
+        with open(f"{CONF}/{name}") as f:
+            return [l.rstrip("\n").rstrip("/") for l in f if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def save(name, items):
+    os.makedirs(CONF, mode=0o700, exist_ok=True)
+    tmp = f"{CONF}/.{name}.tmp"
+    with open(tmp, "w") as f:
+        f.writelines(p + "\n" for p in dict.fromkeys(items))
+    os.replace(tmp, f"{CONF}/{name}")
+
+
+def full(p):
+    p = os.path.abspath(os.path.expanduser(p))
+    parent = os.path.realpath(os.path.dirname(p))  # a link in the last component stays a link
+    return os.path.join(parent, os.path.basename(p)) if p != "/" else p
+
+
+def setfacl(spec, paths, remove=False):
+    """setfacl in batches, through O_PATH descriptors whose real path is checked:
+    the agent names things in open folders, so a folder swapped for a symlink must
+    not redirect a grant elsewhere. Returns the number of failed paths."""
+    bad = 0
+    for i in range(0, len(paths), 256):
+        fds = []
+        try:
+            for p in paths[i:i + 256]:
+                try:
+                    fd = os.open(p, O_PATH | os.O_NOFOLLOW)
+                except OSError:
+                    bad += 1
+                    continue
+                if stat.S_ISLNK(os.fstat(fd).st_mode) or os.readlink(f"/proc/self/fd/{fd}") != p:
+                    os.close(fd)
+                    bad += 1
+                    continue
+                fds.append(fd)
+            if fds:
+                r = subprocess.run(["setfacl", "-x" if remove else "-m", spec, "--",
+                                    *[f"/proc/self/fd/{fd}" for fd in fds]],
+                                   pass_fds=fds, capture_output=True, text=True)
+                bad += sum(1 for l in r.stderr.splitlines() if l.strip())
+        finally:
+            for fd in fds:
+                os.close(fd)
+    return bad
+
+
+def perms(paths):
+    """{path: the agent's ACL entry ('---', 'r-x', ...) or None}."""
+    out = {}
+    for i in range(0, len(paths), 500):
+        r = subprocess.run(["getfacl", "-p", "--", *paths[i:i + 500]], capture_output=True, text=True)
+        cur = None
+        for l in r.stdout.splitlines():
+            if l.startswith("# file: "):
+                cur = re.sub(rb"\\(\\|[0-7]{3})", lambda m: b"\\" if m.group(1) == b"\\" else bytes([int(m.group(1), 8)]),
+                             l[8:].encode()).decode("utf-8", "surrogateescape")
+                out[cur] = None
+            elif cur and l.startswith(f"user:{AGENT}:"):
+                out[cur] = l.split(":")[2][:3]
+    return out
+
+
+def walk(root, prune):
+    """Directories and regular files under root: same filesystem, no symlinks, no prune."""
+    if os.path.islink(root):
+        return [], []
+    if not os.path.isdir(root):
+        return [], [root]
+    dev = os.lstat(root).st_dev
+    dirs, files, stack = [], [], [root]
+    while stack:
+        d = stack.pop()
+        dirs.append(d)
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if e.path in prune or e.is_symlink():
+                continue
+            if e.is_dir(follow_symlinks=False):
+                if e.stat(follow_symlinks=False).st_dev == dev:
+                    stack.append(e.path)
+            elif e.is_file(follow_symlinks=False):
+                files.append(e.path)
+    return dirs, files
+
+
+def state():
+    mode = (lines("mode") or ["strict"])[0]
+    return {"work": lines("write-dirs"), "read": lines("read-only"), "closed": lines("closed"),
+            "env_open": set(lines("env-open")), "mode": mode if mode in ("strict", "relaxed") else "strict"}
+
+
+def mode_of(p, s):
+    """closed, read, work, pass (enter only) or None (the file's own permissions apply)."""
+    if p in s["closed"]:
+        return "closed"
+    if p in s["read"] or any(under(p, r) for r in s["read"]):
+        return "read"
+    if p in s["work"]:  # your explicit rule, even for a protected place (confirmed open)
+        return "work"
+    if any(under(p, w) for w in s["work"]):
+        g = git_dir_of(p)
+        if g is not None:  # a repo's .git runs code as you; read-only unless the agent made the repo
+            return "work" if agent_owns(g) or any(under(p, q) and under(q, g) for q in s["work"]) else "read"
+        return "read" if exec_place(p) else "work"
+    if s["mode"] == "strict" and os.path.dirname(p) == HOME:
+        # strict: everything in ~ is closed unless opened; a folder that holds an
+        # opened one can be entered, not listed
+        return "pass" if any(under(q, p) for q in s["work"] + s["read"]) else "closed"
+    return None
+
+
+def pass_through(path, s):
+    """strict: enter-only folder on the way to an opened one; everything else in it closed."""
+    listed = s["work"] + s["read"] + s["closed"]
+    bad = setfacl(f"u:{AGENT}:--x", [path])
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return bad + 1
+    for n in names:
+        c = os.path.join(path, n)
+        if os.path.islink(c):
+            continue
+        if c in listed:
+            bad += apply(c, s)
+        elif os.path.isdir(c) and any(under(q, c) for q in listed):
+            bad += pass_through(c, s)
+        else:
+            bad += setfacl(f"u:{AGENT}:---", [c])
+    return bad
+
+
+def apply(path, s):
+    """Set the agent's ACL on path and everything below it. Returns the error count."""
+    if not os.path.lexists(path) or os.path.islink(path):
+        return 0
+    m = mode_of(path, s)
+    if m == "closed":
+        spec = f"u:{AGENT}:---" + (",d:u:%s:---" % AGENT if os.path.isdir(path) and not os.path.islink(path) else "")
+        return setfacl(spec, [path])
+    if m == "pass":
+        return pass_through(path, s)
+    # nested list entries and .env files are handled after, never opened in between
+    nested = [p for p in s["closed"] + s["read"] if under(p, path) and p != path]
+    dirs, files = walk(path, set(nested))
+    dirs_set, listed = set(dirs), set(s["work"] + s["read"])
+    # Owner-private items (no read for "others": 600, 700, 660) stay private
+    # unless listed explicitly. Agent-made files are the agent's own.
+    private, envs = [], []
+    work_d, work_f, ro_d, ro_f, plain = [], [], [], [], []
+    for p in sorted(dirs + files):
+        if p != path and is_env(p) and p not in s["env_open"] and os.path.isfile(p):
+            envs.append(p)
+            continue
+        mp = mode_of(p, s) if m != "read" else "read"
+        if mp is not None and p not in listed:
+            if any(under(p, q) for q in private):
+                mp = None
+            else:
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if not st.st_mode & 0o004 and not agent_made(st):
+                    private.append(p)
+                    mp = None
+        if mp == "work":
+            (work_d if p in dirs_set else work_f).append(p)
+        elif mp == "read":
+            (ro_d if p in dirs_set else ro_f).append(p)
+        else:
+            plain.append(p)
+    bad = setfacl(f"u:{AGENT}", plain, remove=True)
+    bad += setfacl(f"d:u:{AGENT}", [p for p in plain if p in dirs_set], remove=True)
+    bad += setfacl(f"u:{AGENT}:rwX", work_d + work_f)
+    bad += setfacl(f"d:u:{AGENT}:rwX,d:u:{OWNER}:rwX", work_d)
+    bad += setfacl(f"u:{AGENT}:r-X", ro_d + ro_f)
+    bad += setfacl(f"d:u:{AGENT}:r-X", ro_d)
+    bad += setfacl(f"u:{AGENT}:---", envs)
+    for p in sorted(nested, key=len):
+        bad += apply(p, s)
+    if envs:
+        s["closed"] += [p for p in envs if p not in s["closed"]]
+        save("closed", s["closed"])
+    return bad
+
+
+def check_path(p):
+    if not under(p, HOME) or p == HOME:
+        return "only paths inside your home folder"
+    if under(p, CONF) or under(CONF, p):
+        return "safeai's own lists"
+    if not os.path.lexists(p):
+        return "no such path"
+    return None
+
+
+def agent_access(paths):
+    """What the kernel lets the agent do with each path: no, r or w."""
+    r = subprocess.run(["sudo", "-n", "-u", AGENT, "sh", "-c",
+                        'for p; do a=no; if [ -d "$p" ]; then [ -r "$p" ] && [ -x "$p" ] && a=r; '
+                        'else [ -r "$p" ] && a=r; fi; [ "$a" = r ] && [ -w "$p" ] && a=w; '
+                        'printf "%s\\n" "$a"; done', "sh", *paths], capture_output=True, text=True)
+    res = r.stdout.split()
+    return res if len(res) == len(paths) else None
+
+
+def git_copies(path):
+    """Repository root if its history (any ref, including tree refs, and the reflog)
+    contains path: the agent could read the closed file from .git. Git runs as the
+    agent - it controls the files in .git, so it must not run as you."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while under(d, HOME) and d != HOME:
+        if os.path.isdir(f"{d}/.git") and not os.path.islink(f"{d}/.git"):
+            break
+        d = os.path.dirname(d)
+    else:
+        return None
+    try:
+        r = subprocess.run(["sudo", "-n", "-u", AGENT, "git", "-C", d, "rev-list", "--all", "--reflog", "--objects"],
+                           capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None
+    rel = os.path.relpath(path, d)
+    for line in r.stdout.splitlines():
+        name = line.partition(" ")[2]
+        if name == rel or name.startswith(rel + "/"):
+            return d
+    return None
+
+
+def agent_cwds(root):
+    r = subprocess.run(["sudo", "-n", "-u", AGENT, "sh", "-c",
+                        'for p in /proc/[0-9]*; do readlink "$p/cwd"; done 2>/dev/null'],
+                       capture_output=True, text=True)
+    return sum(1 for c in r.stdout.splitlines() if under(c, root))
+
+
+def relaxed_default(p, s):
+    """relaxed: which list a folder directly in ~ belongs to by default (or None)."""
+    if s["mode"] != "relaxed" or os.path.dirname(p) != HOME or not os.path.isdir(p) \
+            or os.path.islink(p) or os.path.basename(p).startswith("."):
+        return None
+    return "read" if os.path.basename(p) in NOT_WORK else "work"
+
+
+def confirm(question):
+    """y/n in a terminal, default no; without a terminal the answer is no."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_set(kind, paths, force=False):
+    """kind: work (open), read or closed. Exits with 1 if a path was left as it was or had errors."""
+    s = state()
+    failed = False
+    for raw in paths:
+        p = full(raw)
+        err = check_path(p)
+        protected = kind == "work" and (exec_place(p) or os.path.relpath(p, HOME).startswith("."))
+        if not err and protected and not force and not confirm(
+                f"{p} holds settings or code that run as you (hooks, editor or agent config).\n"
+                f"If the agent can change it, it can act as you. Open it anyway?"):
+            err = "left as it was" if sys.stdin.isatty() else \
+                f"left as it was: it runs code as you; to open it anyway, in a terminal: safeai open {p}"
+        if err:
+            print(f"{raw}: {err}")
+            failed = True
+            continue
+        for k in ("closed", "read", "work"):  # one state per path
+            s[k] = [x for x in s[k] if x != p]
+        s["env_open"].discard(p)
+        s[kind].append(p)
+        if kind != "closed" and is_env(p):
+            s["env_open"].add(p)  # opened by you: the automatic .env closing leaves it alone
+        save("closed", s["closed"])
+        save("read-only", s["read"])
+        save("write-dirs", s["work"])
+        save("env-open", sorted(s["env_open"]))
+        bad = apply(p, s) + reapply_top(p, s)
+        a = (agent_access([p]) or ["?"])[0]
+        what = {"no": "closed to the agent", "r": "agent can read", "w": "agent can read and write", "?": "?"}[a]
+        print(f"{p}: {what}" + (f" ({bad} errors)" if bad else ""))
+        failed |= bool(bad)
+        if kind == "closed":
+            repo = git_copies(p)
+            if repo:
+                print(f"  Warning: copies are in the git history of {repo}; the agent can read them "
+                      f"from .git. Close it too (safeai close {repo}/.git) or clean the history.")
+            if os.path.isdir(p) and agent_cwds(p):
+                print("  Warning: an agent process is working inside; it keeps access until it exits.")
+    if failed:
+        sys.exit(1)
+
+
+def top_dirs():
+    """Visible folders directly in ~ (no symlinks): {path: [dev, ino]}."""
+    out = {}
+    for name in sorted(os.listdir(HOME)):
+        p = f"{HOME}/{name}"
+        if not name.startswith(".") and os.path.isdir(p) and not os.path.islink(p):
+            st = os.lstat(p)
+            if st.st_uid == OWNER_UID:
+                out[p] = [st.st_dev, st.st_ino]
+    return out
+
+
+def save_seen(dirs):
+    os.makedirs(CONF, mode=0o700, exist_ok=True)
+    with open(SEEN + ".tmp", "w") as f:
+        json.dump(dirs, f)
+    os.replace(SEEN + ".tmp", SEEN)
+
+
+def reapply_top(p, s):
+    """Make an opened path reachable. strict: the folder in ~ that holds it switches
+    between closed and enter-only. relaxed: private parents (700) get enter-only."""
+    if os.path.dirname(p) == HOME:
+        return 0
+    top = os.path.join(HOME, os.path.relpath(p, HOME).split("/")[0])
+    if s["mode"] == "strict" and mode_of(top, s) in ("closed", "pass"):
+        return apply(top, s)
+    bad, d = 0, os.path.dirname(p)
+    if p in s["work"] + s["read"]:
+        while d != HOME:
+            if mode_of(d, s) is None and not os.stat(d).st_mode & 0o001 and perms([d]).get(d) is None:
+                bad += setfacl(f"u:{AGENT}:--x", [d])
+            d = os.path.dirname(d)
+    return bad
+
+
+def home_acl(s):
+    return "--x" if s["mode"] == "strict" else "r-x"
+
+
+def cmd_init(mode):
+    """First-time lists. strict: nothing open, secrets closed. relaxed: folders open,
+    programs read-only, secrets closed."""
+    if os.path.exists(f"{CONF}/write-dirs"):
+        sys.exit(f"{CONF} already has lists; use 'safeai settings' to change the mode")
+    dirs = top_dirs()
+    work, read, closed = default_lists(mode)
+    save("mode", [mode])
+    save("write-dirs", work)
+    save("read-only", read)
+    save("closed", closed)
+    save("env-open", [])
+    save_seen(dirs)
+    print(f"Mode: {mode}. Work folders: {len(work)}, read-only: {len(read)}, closed secret stores: {len(closed)}")
+    cmd_setup()
+
+
+def default_lists(mode):
+    """The lists a fresh install starts with: (work, read, closed)."""
+    dirs = top_dirs()
+    closed = [f"{HOME}/{p}" for p in SECRETS if os.path.lexists(f"{HOME}/{p}")]
+    work, read = [], []
+    if mode == "relaxed":
+        work = [p for p in dirs if os.path.basename(p) not in NOT_WORK]
+        read = [p for p in dirs if os.path.basename(p) in NOT_WORK] + \
+               [p for p in (f"{HOME}/.local/bin",) if os.path.isdir(p)]
+    return work, read, closed
+
+
+def cmd_reset():
+    """Drop every rule you set; back to the defaults of the current mode."""
+    s = state()
+    work, read, closed = default_lists(s["mode"])
+    gone = [p for p in s["work"] if p not in work] + [p for p in s["read"] if p not in read] + \
+           [p for p in s["closed"] if p not in closed and not is_env(p)]
+    if not gone and not s["env_open"]:
+        print("Nothing to reset: only the defaults are set.")
+        return
+    print("Your rules that will be dropped:")
+    for p in gone:
+        print(f"  {os.path.relpath(p, HOME)}")
+    if not confirm(f"Drop these {len(gone)} rules and go back to the {s['mode']} defaults?"
+                   " (secret stores and .env files stay closed)"):
+        sys.exit("Nothing changed.")
+    for p in gone:  # strip the agent grant this rule put on the path and everything under it
+        if os.path.lexists(p) and not os.path.islink(p):
+            dirs, files = walk(p, set())
+            setfacl(f"u:{AGENT}", dirs + files, remove=True)
+            setfacl(f"d:u:{AGENT}", dirs, remove=True)
+    save("write-dirs", work)
+    save("read-only", read)
+    save("closed", closed)
+    save("env-open", [])
+    cmd_setup()
+
+
+def cmd_emblems(state_):
+    save("emblems", [state_])
+    # the extension reads the setting when Files starts
+    running = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "nautilus"], capture_output=True).returncode == 0
+    if running:
+        subprocess.run(["nautilus", "-q"], capture_output=True)
+    print(f"Emblems in Files: {state_}" + (" (Files restarted)" if running else ""))
+
+
+def cmd_mode(new):
+    s = state()
+    if new == s["mode"]:
+        print(f"Mode is already {new}")
+        return
+    save("mode", [new])
+    s["mode"] = new
+    if new == "relaxed":  # your visible folders open, programs read-only
+        for p in top_dirs():
+            if p in s["work"] + s["read"] + s["closed"]:
+                continue
+            (s["read"] if os.path.basename(p) in NOT_WORK else s["work"]).append(p)
+        save("write-dirs", s["work"])
+        save("read-only", s["read"])
+    print(f"Mode: {new}")
+    cmd_setup()
+    if new == "strict" and s["work"]:
+        print("Still open: " + ", ".join(os.path.relpath(p, HOME) for p in s["work"] if os.path.lexists(p)))
+        print("Close any of them with: safeai close PATH (or drop all rules: safeai settings, then r)")
+
+
+def cmd_auto():
+    """New folders in ~ (not seen before, by inode) get the mode's default: strict -
+    closed, relaxed - open (programs read-only). safeai-guard runs this."""
+    try:
+        with open(SEEN) as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = None
+    now = top_dirs()
+    save_seen(now)
+    if seen is None:
+        return  # first run: what exists stays as it is
+    known = {tuple(v) for v in seen.values()}
+    s = state()
+    listed = set(s["work"] + s["read"] + s["closed"])
+    for p, ino in now.items():
+        if p in seen or tuple(ino) in known or p in listed:
+            continue  # known (maybe renamed) or already decided
+        d = relaxed_default(p, s)
+        if d:
+            s[d].append(p)
+            save("write-dirs" if d == "work" else "read-only", s[d])
+        apply(p, s)
+
+
+def find_envs(roots, s):
+    out = []
+    closed_dirs = [c for c in s["closed"] if os.path.isdir(c)]
+    for root in roots:
+        for d, sub, files in os.walk(root):
+            sub[:] = [x for x in sub if x not in SKIP_ENV and not os.path.islink(os.path.join(d, x))
+                      and os.path.join(d, x) not in closed_dirs]
+            for f in files:
+                p = os.path.join(d, f)
+                if "\n" not in p and is_env(p) and p not in s["env_open"] and os.path.isfile(p) \
+                        and not os.path.islink(p):
+                    out.append(p)
+    return out
+
+
+def open_dir(p, dir_fd=None, name=None):
+    """A directory fd, without following links; None unless it really is p."""
+    try:
+        fd = os.open(name or p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return None
+    if os.readlink(f"/proc/self/fd/{fd}") != p:
+        os.close(fd)
+        return None
+    return fd
+
+
+def quarantine(dfd, name, p):
+    """Move name (in directory dfd, which is p's parent) to your quarantine folder."""
+    dst = os.path.join(QUARANTINE, datetime.date.today().isoformat(), os.path.relpath(p, HOME))
+    os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+    if os.path.lexists(dst):
+        dst += f".{int(time.time())}"
+    os.rename(name, dst, src_dir_fd=dfd)
+    return dst
+
+
+def foreign(st):
+    return agent_made(st) or stat.S_ISLNK(st.st_mode) or st.st_uid not in (OWNER_UID, AGENT_UID)
+
+
+GIT_CODE = ("config", "config.worktree", "commondir", "gitdir")
+
+
+def git_code(g, p):
+    """p (inside the .git g) makes git run code or read another git directory."""
+    parts = os.path.relpath(p, g).split("/")
+    return "hooks" in parts or parts[-1] in GIT_CODE
+
+
+def planted_by_agent(st):
+    return agent_made(st) or stat.S_ISLNK(st.st_mode)
+
+
+def is_exec_name(name):
+    return name in EXEC_NAMES or name.endswith(".desktop")
+
+
+def check_exec_under(w, s, fix, bad):
+    """Every place under an open folder w that runs code as you. A repository's .git is kept
+    read-only and agent-planted git code (config, hooks, pointers) is quarantined. The other
+    places (.vscode, .claude, .codex, .mcp.json, .envrc, *.desktop) must stay read-only too;
+    any that the agent made (it should never author these) is quarantined, so your editor or
+    tools never load settings the agent controls. Inside the agent's own repositories they are
+    its project's files and stay (like its .git; you do not run your tools there)."""
+    own = []  # tops of the agent's own repositories
+    for d, sub, files in os.walk(w):
+        dfd = None
+        if agent_repo(d):
+            own.append(d)
+        mine = any(under(d, r) for r in own)
+        # config the agent planted (files, dirs or symlinks it authored): quarantine it
+        for name in list(sub) + files:
+            if mine or not is_exec_name(name):
+                continue
+            ep = f"{d}/{name}"
+            if ep in s["work"]:
+                continue  # you opened it yourself (confirmed)
+            try:
+                st = os.lstat(ep)
+            except OSError:
+                continue
+            if planted_by_agent(st):
+                bad(f"agent-made config that runs as you: {ep}")
+                if fix:
+                    if dfd is None:
+                        dfd = open_dir(d)
+                    if dfd is not None:
+                        print(f"  -> quarantine: {quarantine(dfd, name, ep)}")
+                        if name in sub:
+                            sub.remove(name)
+            elif perms([ep]).get(ep) not in ("r-x", "r--"):
+                bad(f"not read-only: {ep}")
+                if fix:
+                    apply(ep, s)
+        if dfd is not None:
+            os.close(dfd)
+        for gf in [x for x in files if x == ".git"]:  # a .git pointer file here
+            gp = f"{d}/{gf}"
+            try:
+                planted = planted_by_agent(os.lstat(gp))
+            except OSError:
+                planted = False
+            if planted:
+                bad(f"agent-made .git pointer: {gp}")
+                if fix:
+                    pfd = open_dir(d)
+                    if pfd is not None:
+                        try:
+                            print(f"  -> quarantine: {quarantine(pfd, gf, gp)}")
+                        finally:
+                            os.close(pfd)
+        gitdirs = [x for x in sub if x == ".git" and not os.path.islink(os.path.join(d, x))]
+        sub[:] = [x for x in sub if x not in SKIP_ENV and not os.path.islink(os.path.join(d, x))]
+        for gname in gitdirs:
+            g = f"{d}/{gname}"
+            if g in s["work"] or agent_owns(g):
+                continue  # you opened it yourself, or it is the agent's own repo
+            for gd, gsub, gfiles in os.walk(g):
+                if gd == f"{g}/objects":  # the object store: large and never executed
+                    gsub[:] = []
+                    continue
+                gsub[:] = [x for x in gsub if not os.path.islink(os.path.join(gd, x))]
+                dfd = open_dir(gd)
+                if dfd is None:
+                    continue
+                try:
+                    for name in list(gsub) + gfiles:
+                        p = f"{gd}/{name}"
+                        if p in s["work"]:
+                            continue
+                        try:
+                            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if planted_by_agent(st) and git_code(g, p):
+                            bad(f"agent-made in your .git: {p}")
+                            if fix:
+                                print(f"  -> quarantine: {quarantine(dfd, name, p)}")
+                                if name in gsub:
+                                    gsub.remove(name)
+                finally:
+                    os.close(dfd)
+            probe = [p for p in (g, f"{g}/config", f"{g}/hooks") if os.path.lexists(p)]
+            if any(v is not None and "w" in v for v in perms(probe).values()):
+                bad(f"agent can write your .git: {g}")
+                if fix:
+                    apply(w, s)
+
+
+def cmd_check(fix):
+    s = state()
+    problems = 0
+
+    def bad(msg):
+        nonlocal problems
+        problems += 1
+        print(msg)
+
+    if perms([HOME]).get(HOME) != home_acl(s):
+        bad(f"{HOME}: agent entry is not {home_acl(s)}")
+        if fix:
+            setfacl(f"u:{AGENT}:{home_acl(s)}", [HOME])
+    if s["mode"] == "strict":  # every unlisted entry in ~ closed (or enter-only)
+        top = [f"{HOME}/{e}" for e in os.listdir(HOME)]
+        top = [p for p in top if not os.path.islink(p) and mode_of(p, s) in ("closed", "pass")]
+        for p, v in perms(top).items():
+            want = "--x" if mode_of(p, s) == "pass" else "---"
+            if v != want:
+                bad(f"not closed (strict mode): {p}")
+                if fix:
+                    apply(p, s)
+            elif fix and want == "--x":
+                apply(p, s)  # new entries next to the opened folders: close them
+    if fix:  # forget paths that no longer exist
+        for k, f in (("closed", "closed"), ("read", "read-only"), ("work", "write-dirs")):
+            if any(not os.path.lexists(p) for p in s[k]):
+                s[k] = [p for p in s[k] if os.path.lexists(p)]
+                save(f, s[k])
+    for p, v in perms([p for p in s["closed"] if os.path.lexists(p)]).items():
+        if v != "---":
+            bad(f"not closed: {p}")
+            if fix:
+                setfacl(f"u:{AGENT}:---", [p])
+    for p, v in perms([p for p in s["read"] if os.path.lexists(p)]).items():
+        if v is None or "w" in v:
+            bad(f"not read-only: {p}")
+            if fix:
+                apply(p, s)
+    roots = [f"{HOME}/{e}" for e in os.listdir(HOME) if e not in SKIP_TOP and not os.path.islink(f"{HOME}/{e}")
+             and os.path.isdir(f"{HOME}/{e}") and f"{HOME}/{e}" not in s["closed"]]
+    envs = find_envs(roots, s) + [f"{HOME}/{e}" for e in os.listdir(HOME) if is_env(e)
+                                  and os.path.isfile(f"{HOME}/{e}") and not os.path.islink(f"{HOME}/{e}")
+                                  and f"{HOME}/{e}" not in s["env_open"]]
+    for p, v in perms(envs).items():
+        if v != "---":
+            bad(f".env open to the agent: {p}")
+        if fix and (v != "---" or p not in s["closed"]):
+            setfacl(f"u:{AGENT}:---", [p])
+            s["closed"].append(p)
+    if fix:
+        save("closed", s["closed"])
+    # your repos live in open folders: the whole .git must stay read-only to the agent, and
+    # nothing the agent made may live in it (config/hooks/modules/worktrees run code as you).
+    for w in s["work"]:
+        if os.path.isdir(w):
+            check_exec_under(w, s, fix, bad)
+    if problems == 0:
+        print("All good")
+    elif not fix:
+        print("Repair: safeai check --fix")
+    return problems
+
+
+def cmd_setup():
+    s = state()
+    setfacl(f"u:{AGENT}:{home_acl(s)}", [HOME])
+    bad, done = 0, []
+    listed = s["work"] + s["read"] + s["closed"]
+    todo = list(listed)
+    top = [f"{HOME}/{e}" for e in os.listdir(HOME) if not os.path.islink(f"{HOME}/{e}")]
+    if s["mode"] == "strict":
+        todo += top
+    else:  # relaxed: drop what strict mode put on entries you did not set
+        free = [p for p in top if not any(under(q, p) for q in listed)]
+        bad += setfacl(f"u:{AGENT}", free, remove=True)
+        bad += setfacl(f"d:u:{AGENT}", [p for p in free if os.path.isdir(p)], remove=True)
+    for p in sorted(set(todo), key=len):
+        if not any(under(p, d) for d in done):
+            bad += apply(p, s)
+            done.append(p)
+    for p in listed:  # opened paths stay reachable through private parents
+        bad += reapply_top(p, s)
+    print(f"Access applied ({bad} errors)")
+    cmd_check(fix=True)
+
+
+AGENT_REPO = "agent's repository: don't run your git here"
+
+
+def agent_repo(p):
+    """p is the top of a repository the agent created itself: its .git holds settings the
+    agent controls, which your own git would follow."""
+    g = f"{p}/.git"
+    return os.path.isdir(p) and not os.path.islink(p) and os.path.isdir(g) and not os.path.islink(g) \
+        and agent_owns(g)
+
+
+def agent_repos(s):
+    out = []
+    for w in s["work"]:
+        if not os.path.isdir(w):
+            continue
+        for d, sub, _ in os.walk(w):
+            if ".git" in sub and agent_repo(d):
+                out.append(d)
+            sub[:] = [x for x in sub if x not in SKIP_ENV and not os.path.islink(os.path.join(d, x))]
+    return sorted(set(out))
+
+
+def cmd_ls(target):
+    d = full(target or ".")
+    if not os.path.lexists(d):
+        sys.exit(f"{d}: no such path")
+    items = [d]
+    if os.path.isdir(d) and not os.path.islink(d):
+        items += [os.path.join(d, n) for n in sorted(os.listdir(d), key=str.lower)]
+    res = agent_access(items)
+    if res is None:
+        sys.exit(f"cannot ask the agent (sudo -u {AGENT})")
+    s = state()
+    names = {"no": "closed", "r": "read", "w": "write", "pass": "enter"}
+    for p, a in zip(items, res):
+        why = ""
+        if p in s["closed"]:
+            why = ".env" if is_env(p) else "your rule"
+        elif p in s["read"]:
+            why = "your rule"
+        elif p in s["work"]:
+            why = "your rule"
+        elif p == HOME and s["mode"] == "strict":
+            a, why = "pass", "strict mode: your home can be entered, not listed"
+        elif mode_of(p, s) == "pass":
+            a, why = "pass", "strict mode: enter only, on the way to an opened folder"
+        elif mode_of(p, s) == "closed":
+            why = "strict mode"
+        elif a == "no" and p != d and res[0] == "no":
+            why = "inside a closed folder"
+        elif a == "no":
+            why = "private by its own permissions"
+        if agent_repo(p):
+            why = f"{why}; {AGENT_REPO}" if why else AGENT_REPO
+        name = p if p == d else os.path.basename(p) + ("/" if os.path.isdir(p) and not os.path.islink(p) else "")
+        if os.path.islink(p):
+            name += " -> " + os.readlink(p)
+        print(f"{names[a]:7} {name}" + (f"   ({why})" if why else ""))
+
+
+AUDIT_LOG = "/var/log/audit/audit.log"
+# x86_64 syscall numbers -> what the agent tried
+SYSCALLS = {2: "open", 257: "open", 437: "open", 85: "create", 76: "truncate", 59: "exec",
+            87: "delete", 263: "delete", 84: "delete", 82: "rename", 264: "rename", 316: "rename",
+            83: "mkdir", 258: "mkdir", 90: "chmod", 268: "chmod", 86: "link", 265: "link", 88: "link", 266: "link"}
+
+
+def audit_value(line, key):
+    """key=value from an audit record; unquoted names are hex-encoded by auditd."""
+    m = re.search(r'(?:^|\s)' + key + r'=("([^"]*)"|(\S+))', line)
+    if not m:
+        return None
+    if m.group(2) is not None:
+        return m.group(2)
+    v = m.group(3)
+    if re.fullmatch(r"(?:[0-9A-F]{2})+", v) and key in ("name", "cwd", "comm", "exe", "proctitle"):
+        return bytes.fromhex(v).decode("utf-8", "replace")
+    return v
+
+
+def cmd_log(arg):
+    hours = None if arg == "all" else int(arg or 24)
+    since = 0 if hours is None else time.time() - hours * 3600
+    files = sorted(glob.glob(AUDIT_LOG + "*"), key=lambda f: -int(f.rsplit(".", 1)[1]) if f[-1].isdigit() else 0)
+    if not files:
+        sys.exit("no audit log readable by you; install with the audit option")
+    events = {}
+    for f in files:
+        try:
+            fh = open(f, errors="replace")
+        except PermissionError:
+            sys.exit(f"{f}: permission denied; reinstall with the audit option")
+        with fh:
+            for line in fh:
+                m = re.search(r"msg=audit\(((\d+)\.\d+:\d+)\)", line)  # serials restart after reboot
+                if not m or int(m.group(2)) < since:
+                    continue
+                typ = line.split(" ", 1)[0][5:]
+                if typ not in ("SYSCALL", "CWD", "PATH", "AVC", "NETFILTER_PKT"):
+                    continue
+                e = events.setdefault(m.group(1), {"ts": int(m.group(2)), "paths": []})
+                if typ == "SYSCALL":
+                    if audit_value(line, "key") != "safeai-deny":
+                        continue
+                    if not e.get("kind", "").startswith("apparmor"):
+                        sc = int(audit_value(line, "syscall") or -1)
+                        e["kind"] = SYSCALLS.get(sc, "syscall")
+                        if sc in (2, 257):  # O_CREAT / O_WRONLY|O_RDWR
+                            fl = int(audit_value(line, "a1" if sc == 2 else "a2") or "0", 16)
+                            e["kind"] = "create" if fl & 0o100 else "write" if fl & 3 else "open"
+                        e["comm"] = audit_value(line, "comm")
+                elif typ == "CWD":
+                    e["cwd"] = audit_value(line, "cwd")
+                elif typ == "PATH":
+                    name = audit_value(line, "name")
+                    e["paths"].append((audit_value(line, "nametype"), None if name == "(null)" else name))
+                elif typ == "AVC" and audit_value(line, "profile") == "safeai-agent":
+                    e["kind"] = "apparmor " + (audit_value(line, "operation") or "")
+                    e["comm"] = audit_value(line, "comm")
+                    e["target"] = audit_value(line, "name")
+                elif typ == "NETFILTER_PKT":  # only safeai's rules log packets to audit
+                    e["kind"] = "network"
+                    e["comm"] = ""
+                    e["target"] = audit_value(line, "daddr") or "?"
+    groups = {}
+    for e in events.values():
+        if "kind" not in e:
+            continue
+        target = e.get("target")
+        if target is None:
+            names = [n for t, n in e["paths"] if n and t != "PARENT"] or [n for t, n in e["paths"] if n]
+            target = names[0] if names else "?"
+            if not target.startswith("/") and e.get("cwd"):
+                target = os.path.normpath(os.path.join(e["cwd"], target))
+        g = groups.setdefault((e["kind"], target, e.get("comm") or ""), [0, 0])
+        g[0] += 1
+        g[1] = max(g[1], e["ts"])
+    if not groups:
+        print("No refusals" + ("" if hours is None else f" in the last {hours} h"))
+        return
+    for (kind, target, comm), (n, ts) in sorted(groups.items(), key=lambda x: x[1][1])[-60:]:
+        target = "~" + target[len(HOME):] if under(target, HOME) else target
+        target, comm = (re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", x) for x in (target, comm))  # names come from the agent
+        print(f"{time.strftime('%m-%d %H:%M', time.localtime(ts))}  {n:>4}x  {kind:<16} {comm:<14} {target}")
+    print(f"Total: {sum(g[0] for g in groups.values())}, distinct: {len(groups)}")
+
+
+def cmd_status():
+    s = state()
+    print(f"Mode: {s['mode']}")
+    for title, key in (("Open (agent reads and writes)", "work"), ("Read-only", "read"), ("Closed", "closed")):
+        print(f"{title}:")
+        for p in s[key]:
+            if os.path.lexists(p):  # deleted paths leave the lists at the next check
+                print(f"  {os.path.relpath(p, HOME)}")
+    repos = agent_repos(s)
+    if repos:
+        print("Agent's repositories (its settings in .git; don't run your git in them):")
+        for p in repos:
+            print(f"  {os.path.relpath(p, HOME)}")
+    if s["mode"] == "strict":
+        print("Everything else in ~ is closed; folders that hold an opened one can be entered, not listed.")
+    else:
+        print("Everything else: your folders open, hidden settings follow their own permissions.")
+    vs = "the agent" if vscode_on() else "you"
+    print(f"Your own terminal runs as you; 'safeai' opens one as {AGENT}. VS Code agents run as {vs}.")
+
+
+LIB = "/usr/local/lib/safeai"
+VSCODE_KEYS = {"claudeCode.claudeProcessWrapper": f"{LIB}/safeai-run", "chatgpt.cliExecutable": f"{LIB}/safeai-codex"}
+
+
+def open_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def vscode_settings():
+    """VS Code user settings files that exist: desktop and Remote-SSH server."""
+    out = []
+    for base, f in ((".config/Code", "User/settings.json"), (".vscode-server", "data/Machine/settings.json")):
+        if os.path.isdir(f"{HOME}/{base}"):
+            out.append(f"{HOME}/{base}/{f}")
+    return out
+
+
+def cmd_vscode(action):
+    files = vscode_settings()
+    for f in files:
+        try:
+            with open(f) as fh:
+                cur = json.load(fh)
+        except FileNotFoundError:
+            cur = {}
+        except ValueError:  # comments or trailing commas: never rewrite such a file
+            print(f"{f}: not plain JSON; edit it by hand:\n{json.dumps(VSCODE_KEYS, indent=2)}")
+            continue
+        on = all(cur.get(k) == v for k, v in VSCODE_KEYS.items())
+        if (action == "on") == on:
+            continue
+        backup, created = f + ".safeai-backup", f + ".safeai-created"
+        if action == "on":
+            if os.path.exists(f):
+                if not os.path.exists(backup):
+                    shutil.copy2(f, backup)  # the original, byte for byte
+            else:
+                open(created, "w").close()  # the file did not exist before
+            cur.update(VSCODE_KEYS)
+        else:
+            for k, v in VSCODE_KEYS.items():
+                if cur.get(k) == v:
+                    del cur[k]
+            if os.path.exists(backup) and open_json(backup) == cur:
+                os.replace(backup, f)  # nothing else changed: the original file, as it was
+                print(f"{f}: restored as it was (reload the VS Code window)")
+                continue
+            if os.path.exists(created) and not cur:
+                os.remove(f)
+                os.remove(created)
+                print(f"{f}: removed, it did not exist before")
+                continue
+            for x in (backup, created):
+                if os.path.exists(x):
+                    os.remove(x)
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f + ".tmp", "w") as fh:
+            json.dump(cur, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(f + ".tmp", f)
+        print(f"{f}: {'Claude Code and Codex run as ' + AGENT if action == 'on' else 'back to default'}"
+              " (reload the VS Code window)")
+    if action == "on":  # the agent runs the extensions' own binaries
+        ext = [f"{HOME}/{d}/extensions" for d in (".vscode", ".vscode-server") if os.path.isdir(f"{HOME}/{d}/extensions")]
+        s = state()
+        new = [p for p in ext if p not in s["read"]]
+        if new:
+            cmd_set("read", new)
+
+
+REPO = system_conf("REPO", "https://github.com/nezabudkinvo/linux-ai-agent-sandbox")
+
+
+def version(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+def cmd_update():
+    """Fetch the latest version into a private temporary folder and run its installer
+    with the answers given last time. Your lists and the agent user stay."""
+    tmp = tempfile.mkdtemp(prefix="safeai-update-")  # mode 700: the agent cannot touch it
+    try:
+        src = f"{tmp}/src"
+        if shutil.which("git"):
+            r = subprocess.run(["git", "clone", "-q", "--depth", "1", REPO, src], stdin=subprocess.DEVNULL)
+        else:
+            os.makedirs(src)
+            r = subprocess.run(f"curl -fsSL {REPO}/archive/refs/heads/main.tar.gz | tar -xz -C {src} --strip-components=1",
+                               shell=True)
+        if r.returncode:
+            sys.exit(f"could not download {REPO}")
+        cur, new = version(f"{LIB}/VERSION"), version(f"{src}/VERSION")
+        if cur == new:
+            print(f"safeai {cur} is up to date")
+            return
+        print(f"safeai {cur} -> {new}", flush=True)
+        r = subprocess.run(["sudo", f"{src}/install.sh", "--update"])
+        sys.exit(r.returncode)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+NAUTILUS_EXT = f"{HOME}/.local/share/nautilus-python/extensions/safeai_nautilus.py"
+
+
+def vscode_on():
+    return any(open_json(f).get("claudeCode.claudeProcessWrapper") == VSCODE_KEYS["claudeCode.claudeProcessWrapper"]
+               for f in vscode_settings())
+
+
+SETTINGS = {  # name: (values, what it is)
+    "mode": (("relaxed", "strict"), "default for what you did not set"),
+    "vscode": (("agent", "you"), "who runs Claude Code and Codex in VS Code"),
+    "emblems": (("on", "off"), "closed / read-only emblems in Files"),
+    "notifications": (("on", "off"), "Files tells you about problems"),
+}
+
+
+def setting(name):
+    if name == "mode":
+        return state()["mode"]
+    if name == "vscode":
+        return "agent" if vscode_on() else "you"
+    return "off" if lines(name) == ["off"] else "on"
+
+
+def unavailable():
+    """{setting: why it cannot be changed here}; they come alive once the program is there."""
+    out = {}
+    if not vscode_settings():
+        out["vscode"] = "no VS Code settings of yours yet: open VS Code once"
+    if not os.path.exists(NAUTILUS_EXT):
+        for n in ("emblems", "notifications"):
+            out[n] = "Files extension not installed: see README, VS Code and Files"
+    return out
+
+
+def cmd_setting_set(name, value):
+    if name not in SETTINGS or value not in SETTINGS[name][0]:
+        sys.exit("safeai settings set: " + "; ".join(f"{k} {'|'.join(v)}" for k, (v, _w) in SETTINGS.items()))
+    if name in unavailable():
+        sys.exit(f"{name}: {unavailable()[name]}")
+    if name == "mode":
+        cmd_mode(value)
+    elif name == "vscode":
+        cmd_vscode("on" if value == "agent" else "off")
+    elif name == "emblems":
+        cmd_emblems(value)
+    else:  # the Files extension reads it at every action
+        save(name, [value])
+        print(f"{name}: {value}")
+
+
+def cmd_settings():
+    """The settings that apply here, in a numbered menu; a change is the same as settings set."""
+    while True:
+        rows = list(SETTINGS)
+        missing = unavailable()
+        for i, name in enumerate(rows, 1):
+            values, what = SETTINGS[name]
+            cur = "-" if name in missing else setting(name)
+            print(f"  {i}  {name:14} {cur:8} {'/'.join(values):15} {missing.get(name, what)}")
+        print("  r  reset: drop all your rules, back to the mode's defaults (asks first)")
+        if not sys.stdin.isatty():
+            return print("Change: safeai settings (in a terminal) or safeai settings set NAME VALUE")
+        try:
+            n = input("Number to change, r to reset (Enter to quit): ").strip()
+        except EOFError:
+            return print()
+        if not n:
+            return
+        if n.lower() == "r":
+            print()
+            try:
+                cmd_reset()
+            except SystemExit as e:  # "Nothing changed" and the like: back to the menu
+                if e.code not in (None, 0):
+                    print(e.code)
+            print()
+            continue
+        if not n.isdigit() or not 1 <= int(n) <= len(rows):
+            print(f"Type a number from 1 to {len(rows)}")
+            continue
+        name = rows[int(n) - 1]
+        if name in missing:
+            print(f"\n{name}: {missing[name]}\n")
+            continue
+        a, b = SETTINGS[name][0]
+        new = b if setting(name) == a else a  # every setting has two values: the other one
+        print()
+        if name == "mode":  # the only one that changes access to your whole home: ask
+            what = ("the agent sees nothing in your home until you open it; what you opened stays open"
+                    if new == "strict" else "your visible folders open to the agent, programs read-only")
+            if not confirm(f"Switch to {new}: {what}?"):
+                print()
+                continue
+        cmd_setting_set(name, new)
+        print()
+
+
+def cmd_start():
+    """A shell as the agent in the current folder, inside its AppArmor profile.
+    A folder closed to the agent is offered to be opened first (default no)."""
+    cwd = os.path.realpath(".")
+    if (agent_access([cwd]) or ["no"])[0] == "no":
+        if cwd == HOME or not under(cwd, HOME):
+            sys.exit(f"{cwd} is closed to the agent; start it in a folder inside your home")
+        if not confirm(f"{cwd} is closed to the agent. Open it (read and write)?"):
+            sys.exit("Nothing changed.")
+        cmd_set("work", [cwd])
+        if (agent_access([cwd]) or ["no"])[0] == "no":
+            sys.exit(1)
+    if sys.stdin.isatty():
+        print(f"safeai: a shell as {AGENT} in {cwd} (exit to leave)")
+    run = f"{LIB}/safeai-run"
+    os.execv(run, [run, "bash", "-l"])
+
+
+def main(a):
+    for stream in (sys.stdout, sys.stderr):  # a non-UTF-8 filename must not abort a check
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+    if os.getuid() == AGENT_UID or OWNER == "root":
+        sys.exit("run safeai as yourself")
+    if a and a[0] in ("-h", "--help", "help"):
+        return print(__doc__.strip())
+    if a == ["--version"]:
+        return print(version(f"{LIB}/VERSION"))
+    if a == ["update"]:
+        return cmd_update()
+    if not a:
+        return cmd_start()
+    if a == ["status"]:
+        return cmd_status()
+    if a == ["settings"]:
+        return cmd_settings()
+    if len(a) == 4 and a[:2] == ["settings", "set"]:
+        return cmd_setting_set(a[2], a[3])
+    c = a[0]
+    if c == "open" and a[1:2] == ["--force"] and len(a) > 2:
+        return cmd_set("work", a[2:], force=True)
+    if c in ("open", "read", "close") and len(a) > 1:
+        return cmd_set({"open": "work", "read": "read", "close": "closed"}[c], a[1:])
+    if c == "_auto" and len(a) == 1:
+        return cmd_auto()
+    if c == "init" and len(a) <= 2 and (len(a) == 1 or a[1] in ("strict", "relaxed")):
+        return cmd_init(a[1] if len(a) > 1 else "relaxed")
+    if c == "check":
+        return sys.exit(1 if cmd_check("--fix" in a) and "--fix" not in a else 0)
+    if c == "log" and len(a) <= 2 and (len(a) == 1 or a[1] == "all" or a[1].isdigit()):
+        return cmd_log(a[1] if len(a) > 1 else None)
+    if c == "ls" and len(a) <= 2:
+        return cmd_ls(a[1] if len(a) > 1 else None)
+    if c == "setup":
+        return cmd_setup()
+    sys.exit(f"safeai: unknown command or arguments: {' '.join(a)}\nSee: safeai --help")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

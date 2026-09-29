@@ -1,0 +1,105 @@
+#!/usr/bin/python3 -I
+"""safeai-acl-clean OWNER AGENT - undo what safeai did to the permissions of OWNER's
+home folder (uninstall.sh runs it as root, after the agent's processes are gone).
+
+- removes the ACL entries safeai added (for AGENT and OWNER, access and default);
+  when nothing else is left in an ACL, removes it entirely and puts back the
+  group permissions the file really had (group entry and mask);
+- files the agent created carry its group (the "agent made" mark) or, in a few
+  places, its user: they get OWNER and OWNER's group.
+ACLs other programs or people set are left alone.
+"""
+import os
+import pwd
+import stat
+import struct
+import subprocess
+import sys
+
+owner, agent = pwd.getpwnam(sys.argv[1]), pwd.getpwnam(sys.argv[2])
+OWNER_UID, OWNER_GID, HOME = owner.pw_uid, owner.pw_gid, owner.pw_dir
+AGENT_UID, AGENT_GID = agent.pw_uid, agent.pw_gid
+USER, GROUP = 0x02, 0x08  # named entries; the rest are base entries and the mask
+
+
+def entries(path, name, perms=False):
+    try:
+        raw = os.getxattr(path, name, follow_symlinks=False)
+    except OSError:
+        return None
+    items = list(struct.iter_unpack("<HHI", raw[4:]))
+    return items if perms else [(tag, uid) for tag, _perm, uid in items]
+
+
+def effective_group(path):
+    """Group permissions to keep: group entry & mask, and never more than the
+    owner has. Files created under safeai's default ACL inherit the folder's group
+    entry (rwx on a 775 folder); without the cap a new 664 file would end up 674."""
+    items = entries(path, "system.posix_acl_access", perms=True) or []
+    group = next((p for t, p, _ in items if t == 0x04), None)
+    mask = next((p for t, p, _ in items if t == 0x10), 7)
+    owner = next((p for t, p, _ in items if t == 0x01), 7)
+    return None if group is None else group & mask & owner
+
+
+def plan(path):
+    """setfacl arguments that undo safeai on path (empty: nothing to do)."""
+    acc = entries(path, "system.posix_acl_access") or []
+    dfl = entries(path, "system.posix_acl_default")
+    mine = (AGENT_UID, OWNER_UID)  # safeai's default ACL also names the owner; new files inherit it
+    ours_acc = [u for t, u in acc if t == USER and u in mine]
+    ours_dfl = [u for t, u in (dfl or []) if t == USER and u in mine]
+    if not ours_acc and not ours_dfl:
+        return []
+    others_acc = any(t in (USER, GROUP) and not (t == USER and u in mine) for t, u in acc)
+    others_dfl = any(t in (USER, GROUP) and not (t == USER and u in mine) for t, u in (dfl or []))
+    if not others_acc and not others_dfl:
+        return [["-b"]]  # only safeai's entries: back to the plain mode
+    cmds = [["-x", f"u:{u}"] for u in ours_acc]
+    if dfl is not None and ours_dfl:
+        if others_dfl:
+            cmds += [["-x", f"d:u:{u}"] for u in ours_dfl]
+        else:
+            cmds.append(["-k"])
+    return cmds
+
+
+def fix(path, st):
+    steps = plan(path)
+    group = effective_group(path) if ["-b"] in steps else None
+    for args in steps:
+        subprocess.run(["setfacl", *args, "--", path], capture_output=True)
+    if group is not None:
+        # setfacl -b puts the ACL's group entry into the mode; the mask could be
+        # narrower (files created under safeai's default ACL): keep what ls showed
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        os.chmod(path, (mode & ~0o070) | (group << 3))
+    if st.st_uid == AGENT_UID or st.st_gid == AGENT_GID:
+        os.chown(path, OWNER_UID, OWNER_GID, follow_symlinks=False)
+
+
+def main():
+    root_dev = os.lstat(HOME).st_dev
+    fix(HOME, os.lstat(HOME))
+    for d, subdirs, files in os.walk(HOME):
+        keep = []
+        for name in subdirs + files:
+            p = os.path.join(d, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                if st.st_uid == AGENT_UID or st.st_gid == AGENT_GID:
+                    os.chown(p, OWNER_UID, OWNER_GID, follow_symlinks=False)
+                continue
+            if st.st_dev != root_dev:
+                continue
+            fix(p, st)
+            if name in subdirs:
+                keep.append(name)
+        subdirs[:] = keep
+
+
+if __name__ == "__main__":
+    main()

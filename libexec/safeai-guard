@@ -1,0 +1,296 @@
+#!/usr/bin/python3 -I
+"""safeai-guard - root service that watches the owner's filesystem.
+
+- Files the agent creates in open folders become the owner's (group = the
+  agent's group, which marks them as agent-made). Sandboxed apps (snap, flatpak)
+  often refuse files owned by another user; the agent keeps its ACL entry.
+- A new .env-like file anywhere under the owner's home is closed to the agent
+  the moment its name appears. Agent processes that already opened it are killed.
+- A new entry in a place that runs code as the owner (.git/config, .git/hooks,
+  .vscode, ...) becomes read-only to the agent the moment it appears. Agent files
+  there are not adopted: `safeai check` quarantines them.
+- A new folder directly in the home folder
+  gets the mode's default (`safeai _auto`, run as the owner).
+
+Everything is done through O_PATH descriptors: names in open folders come from
+the agent, so paths are never trusted twice.
+
+    safeai-guard           run (fanotify, full rescan every 10 minutes)
+    safeai-guard --scan    one rescan and exit
+"""
+import ctypes
+import os
+import pwd
+import re
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+
+def system_conf(key, default=None):
+    try:
+        with open("/etc/safeai.conf") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == key and v:
+                    return v
+    except OSError:
+        pass
+    return default
+
+
+OWNER = system_conf("OWNER") or sys.exit("OWNER missing in /etc/safeai.conf")
+AGENT = system_conf("AGENT", "aiagent")
+_o, _a = pwd.getpwnam(OWNER), pwd.getpwnam(AGENT)
+OWNER_UID, AGENT_UID, AGENT_GID, HOME = _o.pw_uid, _a.pw_uid, _a.pw_gid, _o.pw_dir
+WRITE_DIRS = f"{HOME}/.config/safeai/write-dirs"
+ENV_OPEN = f"{HOME}/.config/safeai/env-open"
+RESCAN = 600
+ENV_NAME = re.compile(rb"^(\.env(\..+)?|.+\.env)$")
+ENV_SAMPLE = re.compile(rb"[.-](example|sample|template|dist|defaults?)(\.env)?$", re.I)
+EXEC_NAMES = (".vscode", ".envrc", ".claude", ".codex", ".mcp.json")
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
+libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64, ctypes.c_int, ctypes.c_char_p]
+libc.open_by_handle_at.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+libc.fchownat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_int]
+AT_EMPTY_PATH, AT_FDCWD = 0x1000, -100
+O_PATH = getattr(os, "O_PATH", 0o10000000)
+
+
+def work_dirs():
+    try:
+        with open(WRITE_DIRS) as f:
+            return [l.rstrip("\n").rstrip("/") for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        return []
+
+
+def under(p, root):
+    return p == root or p.startswith(root + "/")
+
+
+def exec_place(p):
+    parts = p.split("/")
+    for i, name in enumerate(parts):
+        if name in EXEC_NAMES or name.endswith(".desktop"):
+            return True
+        if name == ".git":  # the whole .git runs code as the owner (config, hooks, modules, worktrees)
+            return True
+    return False
+
+
+def is_secret(name):
+    """A .env-like secret name (bytes), sample files excepted - as close_env matches."""
+    return bool(ENV_NAME.match(name)) and not ENV_SAMPLE.search(name)
+
+
+def adopt(fd, dirs):
+    """Give an agent-owned object (O_PATH, not followed) to the owner."""
+    st = os.fstat(fd)
+    if st.st_uid != AGENT_UID:
+        return False
+    real = os.readlink(f"/proc/self/fd/{fd}")
+    if not any(under(real, d) and real != d for d in dirs) or exec_place(real):
+        return False
+    secret = stat.S_ISREG(st.st_mode) and is_secret(os.path.basename(real).encode())
+    if libc.fchownat(fd, b"", OWNER_UID, AGENT_GID, AT_EMPTY_PATH) != 0:
+        return False
+    if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISGID:
+        # setgid would give the owner's new files the agent's group, i.e. the agent mark
+        os.chmod(f"/proc/self/fd/{fd}", stat.S_IMODE(st.st_mode) & ~stat.S_ISGID)
+    if not stat.S_ISLNK(st.st_mode):
+        # a secret the agent made becomes the owner's and stays closed (no window where
+        # adoption re-grants access); otherwise keep the agent's rights visible (the ACL mask,
+        # since mode 600 would hide them)
+        bits = "rwx" if stat.S_ISDIR(st.st_mode) or st.st_mode & 0o100 else "rw-"
+        spec = f"u:{AGENT}:---" if secret else f"u:{AGENT}:{bits},m::{bits}"
+        subprocess.run(["setfacl", "-m", spec, f"/proc/{os.getpid()}/fd/{fd}"], capture_output=True)
+    return True
+
+
+def close_env(fd, name):
+    """Close a new .env-like regular file (O_PATH, not followed) to the agent."""
+    if not is_secret(name):
+        return False
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    real = os.readlink(f"/proc/self/fd/{fd}")
+    if not under(real, HOME):
+        return False
+    try:
+        with open(ENV_OPEN) as f:
+            if real in (l.rstrip("\n") for l in f):
+                return False
+    except OSError:
+        pass
+    ok = subprocess.run(["setfacl", "-m", f"u:{AGENT}:---", f"/proc/{os.getpid()}/fd/{fd}"],
+                        capture_output=True).returncode == 0
+    if ok:
+        drop_holders(st)
+    return ok
+
+
+def close_exec(fd):
+    """A new entry in a place that runs code as the owner (.git/config, .git/hooks,
+    .vscode, ...) - the whole .git included: read-only to the agent the moment it appears, as .env is
+    closed. It would otherwise inherit write access from the open folder around it
+    (git init, git clone, and every config rewrite, which renames a new file in).
+    The agent's own entries there are left to `safeai check` (quarantine)."""
+    st = os.fstat(fd)
+    if st.st_uid == AGENT_UID or stat.S_ISLNK(st.st_mode):
+        return False
+    real = os.readlink(f"/proc/self/fd/{fd}")
+    if not under(real, HOME) or not exec_place(real):
+        return False
+    if "/.git/objects/" in real:
+        # the object store inherits read-only from .git/objects (locked with the repo);
+        # a setfacl per object would stall the queue (and new .env files) on big commits
+        return False
+    if stat.S_ISDIR(st.st_mode):
+        spec = f"u:{AGENT}:r-x,d:u:{AGENT}:r-x"
+    else:
+        spec = f"u:{AGENT}:" + ("r-x" if st.st_mode & 0o100 else "r--")
+    return subprocess.run(["setfacl", "-m", spec, f"/proc/{os.getpid()}/fd/{fd}"],
+                          capture_output=True).returncode == 0
+
+
+def drop_holders(st):
+    """Permissions are checked at open(): an agent process that opened the file
+    before it was closed could keep reading it. Kill such processes."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != AGENT_UID:
+                continue
+            for n in os.listdir(f"/proc/{pid}/fd"):
+                t = os.stat(f"/proc/{pid}/fd/{n}")
+                if (t.st_dev, t.st_ino) == (st.st_dev, st.st_ino):
+                    os.kill(int(pid), 9)
+                    print(f"killed agent process {pid}: it held a new .env open", file=sys.stderr, flush=True)
+                    break
+        except OSError:
+            pass
+
+
+def scan_env():
+    """Close every .env under the home folder (at start and after lost events)."""
+    r = subprocess.run(["find", HOME, "-xdev", "(", "-name", "node_modules", "-o", "-name", ".git", ")", "-prune",
+                        "-o", "-type", "f", "(", "-name", ".env", "-o", "-name", ".env.*", "-o", "-name", "*.env", ")",
+                        "-print0"], capture_output=True)
+    for p in r.stdout.split(b"\0"):
+        if p:
+            with_fd(p, lambda fd: close_env(fd, os.path.basename(p)))
+
+
+def new_top_folder():
+    """A folder appeared in ~: let the owner's safeai decide (it keeps the lists)."""
+    subprocess.run(["runuser", "-u", OWNER, "--", "/usr/local/bin/safeai", "_auto"],
+                   capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+
+
+def with_fd(path, fn):
+    try:
+        fd = os.open(path, O_PATH | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        return fn(fd)
+    finally:
+        os.close(fd)
+
+
+def scan():
+    dirs = work_dirs()
+    if not dirs:
+        return 0
+    r = subprocess.run(["find", *dirs, "-xdev", "-user", AGENT, "-print0"], capture_output=True)
+    return sum(with_fd(p, lambda fd: adopt(fd, dirs)) for p in r.stdout.split(b"\0") if p)
+
+
+class FanotifyUnavailable(Exception):
+    pass
+
+
+def watch():
+    FAN_CLOEXEC, FAN_UNLIMITED_QUEUE, FAN_REPORT_DFID_NAME = 1, 0x10, 0x400 | 0x800
+    FAN_MARK_ADD, FAN_MARK_FILESYSTEM = 1, 0x100
+    FAN_CREATE, FAN_MOVED_TO, FAN_ONDIR, FAN_Q_OVERFLOW = 0x100, 0x80, 0x40000000, 0x4000
+    # unlimited queue: flooding with new files must not push a .env event out
+    fan = libc.fanotify_init(FAN_CLOEXEC | FAN_UNLIMITED_QUEUE | FAN_REPORT_DFID_NAME, os.O_RDONLY)
+    if fan < 0:
+        raise FanotifyUnavailable(os.strerror(ctypes.get_errno()))
+    if libc.fanotify_mark(fan, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_CREATE | FAN_MOVED_TO | FAN_ONDIR,
+                          AT_FDCWD, HOME.encode()) != 0:
+        raise FanotifyUnavailable(os.strerror(ctypes.get_errno()))
+    mount_fd = os.open(HOME, os.O_RDONLY | os.O_DIRECTORY)
+    home = os.stat(HOME)
+    scan()
+    scan_env()
+    last = time.monotonic()
+    while True:
+        if time.monotonic() - last > RESCAN:
+            scan()
+            last = time.monotonic()
+        dirs = work_dirs()
+        buf = os.read(fan, 65536)
+        pos = 0
+        while pos + 24 <= len(buf):
+            ev_len, _v, _r, meta_len, mask, _fd, _pid = struct.unpack_from("<IBBHQii", buf, pos)
+            if ev_len < 24:
+                break
+            if mask & FAN_Q_OVERFLOW:
+                last = 0
+                scan_env()
+            info = pos + meta_len
+            while info + 4 <= pos + ev_len:
+                itype, _pad, ilen = struct.unpack_from("<BBH", buf, info)
+                if ilen == 0:
+                    break
+                if itype == 2:  # FAN_EVENT_INFO_TYPE_DFID_NAME: fsid, file handle, name
+                    h = info + 4 + 8
+                    hbytes = struct.unpack_from("<I", buf, h)[0]
+                    handle = bytes(buf[h:h + 8 + hbytes])
+                    name = bytes(buf[h + 8 + hbytes:info + ilen]).split(b"\0", 1)[0]
+                    dfd = libc.open_by_handle_at(mount_fd, handle, O_PATH | os.O_DIRECTORY)
+                    if dfd >= 0:
+                        try:
+                            if mask & FAN_ONDIR and name and not name.startswith(b"."):
+                                st = os.fstat(dfd)
+                                if (st.st_dev, st.st_ino) == (home.st_dev, home.st_ino):
+                                    new_top_folder()
+                            if name and name not in (b".", b".."):
+                                fd = os.open(name, O_PATH | os.O_NOFOLLOW, dir_fd=dfd)
+                                try:
+                                    close_env(fd, name)
+                                    close_exec(fd)
+                                    adopt(fd, dirs)
+                                finally:
+                                    os.close(fd)
+                        except OSError:
+                            pass
+                        finally:
+                            os.close(dfd)
+                info += ilen
+            pos += ev_len
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--scan"]:
+        print(f"adopted: {scan()}")
+        scan_env()
+    else:
+        try:
+            watch()
+        except FanotifyUnavailable as e:  # old kernel: poll instead
+            print(f"fanotify: {e}; rescanning every 30 s", file=sys.stderr, flush=True)
+            while True:
+                scan()
+                scan_env()
+                time.sleep(30)
+        # any other error: exit, systemd restarts the service

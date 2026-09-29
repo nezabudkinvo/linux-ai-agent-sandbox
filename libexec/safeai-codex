@@ -1,0 +1,6 @@
+#!/bin/sh
+# Codex from the VS Code extension (setting chatgpt.cliExecutable), run through safeai-run.
+codex=$(ls -d "$HOME"/.vscode/extensions/openai.chatgpt-*/bin/*/codex \
+              "$HOME"/.vscode-server/extensions/openai.chatgpt-*/bin/*/codex 2>/dev/null | sort -V | tail -1)
+[ -x "$codex" ] || { echo "safeai-codex: codex binary of the VS Code extension not found" >&2; exit 1; }
+exec "$(dirname "$0")/safeai-run" "$codex" "$@"

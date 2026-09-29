@@ -1,0 +1,79 @@
+# Russian messages for install.sh and uninstall.sh (loaded when the language is "ru").
+# Keys and %s placeholders must match the English tables in those scripts.
+# shellcheck disable=SC2034
+MSG[error]="ошибка: %s"
+MSG[error_line]="ошибка в строке %s"
+MSG[reverting]="откатываю то, что уже сделано"
+MSG[sudo_why]="Для установки нужны права root на изменения выше; sudo сейчас спросит ваш пароль."
+MSG[err_home]="не найден домашний каталог пользователя %s"
+MSG[err_systemd]="нужен systemd"
+MSG[err_python]="нужен python 3.8 или новее"
+MSG[err_pkg]="установите %s своим менеджером пакетов и запустите снова"
+MSG[q_agent]="Имя пользователя Linux для агента"
+MSG[err_name]="недопустимое имя пользователя: %s"
+MSG[err_same]="агент должен быть отдельным пользователем"
+MSG[err_exists]="пользователь %s уже есть и создан не safeai; выберите другое имя"
+MSG[q_mode]="Режим для домашнего каталога: relaxed (ваши папки открыты, настройки только для чтения, секреты закрыты) или strict (агент ничего не видит, пока вы не откроете)"
+MSG[err_mode]="ответьте relaxed или strict"
+MSG[q_apparmor]="AppArmor: запрещать любому процессу агента открывать файлы вида .env в момент открытия"
+MSG[q_audit]="Журнал отказов (safeai log; ставит auditd и меняет группу его журнала)"
+MSG[q_vscode]="VS Code: Claude Code и Codex всегда работают от агента (safeai settings возвращает как было)"
+MSG[q_nautilus]="Файлы (Nautilus): меню по правому клику и значки"
+MSG[plan]="План"
+MSG[plan_head]="Владелец: %s    пользователь агента: %s    режим: %s\n\nС sudo, от root:"
+MSG[mode_keep]="как было"
+MSG[plan_core]="  пользователь %s (без пароля, без ваших групп, без sudo)
+  /etc/sudoers.d/safeai          %s может запускать программы от %s; обратного права нет
+  /etc/safeai.conf, /usr/local/bin/safeai (с дополнением по Tab), %s/
+  службы safeai-guard (root), safeai-check.timer (от %s, каждые 5 минут)"
+MSG[plan_lists]="  ваши списки в %s (хранилища ключей вроде ~/.ssh закрыты в обоих режимах)"
+MSG[plan_apparmor]="  профиль AppArmor /etc/apparmor.d/safeai-agent; оболочка входа %s -> %s/safeai-shell;
+  %s добавлен в /etc/cron.deny и /etc/at.deny (с резервной копией)"
+MSG[plan_audit]="  правила аудита /etc/audit/rules.d/50-safeai.rules;
+  /etc/audit/auditd.conf: log_group -> %s (с резервной копией)"
+MSG[plan_packages]="  пакеты через %s: %s (и то, от чего они зависят)"
+MSG[plan_you]="От вас (без root):
+  записи ACL для %s на ваших файлах (только записи этого пользователя; удаляются при удалении)"
+MSG[plan_agent]="От %s: его инструкции (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), доверие git к вашим
+  репозиториям и ваши имя и почта git для его коммитов"
+MSG[plan_vscode]="  settings.json VS Code: две настройки (копия в settings.json.safeai-backup)"
+MSG[plan_nautilus]="  ~/.local/share/nautilus-python/extensions/safeai_nautilus.py;
+  Файлы перезапускаются, чтобы его загрузить (открытые окна Файлов закроются)"
+MSG[plan_untouched]="Не трогает: сеть, других пользователей, ваши группы и вход, другие службы."
+MSG[proceed]="Продолжить? [Y/n]: "
+MSG[nothing]="Ничего не изменено."
+MSG[s_core]="Основа"
+MSG[s_apparmor]="AppArmor"
+MSG[s_audit]="Журнал отказов"
+MSG[s_vscode]="VS Code"
+MSG[s_nautilus]="Файлы (Nautilus)"
+MSG[s_done]="Готово"
+MSG[err_acl]="файловая система домашнего каталога не поддерживает ACL"
+MSG[err_groups]="%s состоит в других группах"
+MSG[err_writable]="в %s может писать %s; запустите установку из папки, куда агент писать не может"
+MSG[err_sudoers]="проверка правила sudo не прошла"
+MSG[err_auditgroup]="в группе %s есть другие пользователи, они смогут читать журнал аудита; запустите снова и ответьте n на этот вопрос"
+MSG[restart_files]="Файлы перезапущены, расширение загружено"
+MSG[done]="  safeai                  терминал от агента в этой папке (дальше claude, codex, ...; выход - exit)
+  safeai status           режим и ваши правила
+  safeai ls ПАПКА         что агенту можно в папке
+  safeai open ПУТЬ        агент читает и пишет
+  safeai read ПУТЬ        только читает
+  safeai close ПУТЬ       закрыто
+  safeai settings         настройки; r там убирает все ваши правила (спросит)
+  Проверка:               %s/check.sh
+  Удалить:                sudo %s/uninstall.sh
+  Скачанная копия больше не нужна, ее можно удалить."
+
+# uninstall.sh
+MSG[u_confirm]="Удалить safeai вместе со службами, вашими правилами и доступом агента к вашим файлам? [y/N]: "
+MSG[u_agent]="Удалить пользователя агента %s с его домашним каталогом (входы, история чатов, программы агента)? [Y/n]: "
+MSG[u_packages]="Удалить пакеты, которые поставил safeai (%s)? [Y/n]: "
+MSG[u_nothing]="Ничего не изменено."
+MSG[u_user_deleted]="Пользователь %s удален."
+MSG[u_kept_agent]="Оставлен пользователь %s (теперь обычный; доступ, который давал safeai, снят). Удалить позже: sudo userdel -r %s"
+MSG[u_kept_packages]="Оставлены пакеты: %s"
+MSG[u_source]="Удалить скачанную копию, из которой шла установка (%s)? [Y/n]: "
+MSG[u_kept_source]="Скачанная копия оставлена: %s"
+MSG[u_cd_away]="Терминал все еще в удаленной папке; выйдите из нее: cd ~"
+MSG[u_done]="safeai удален. Файлы, которые агент сделал в ваших папках, остаются - они ваши."
