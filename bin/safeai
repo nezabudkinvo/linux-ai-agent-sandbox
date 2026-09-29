@@ -9,12 +9,15 @@ folder or file, what it may do; the kernel enforces it with ACLs.
                                       Plain claude in your own terminal stays yours
     safeai status                   mode and every rule you set
     safeai settings                 show the settings and change them in a menu; there, r drops
-                                      all your rules and goes back to the mode's defaults (asks first)
+                                      all your rules and goes back to the mode's defaults, u installs
+                                      a newer signed release (both ask first)
+    safeai settings update          the same update, without the menu
     safeai settings set NAME VALUE  change one without the menu (for scripts):
-                                      mode relaxed|strict - for everything you did not set:
-                                        relaxed - your folders open, settings and programs
-                                                  read-only (the default)
+                                      mode strict|relaxed - for everything you did not set:
                                         strict  - the agent sees nothing in your home
+                                                  until you open it (the default)
+                                        relaxed - your folders open, settings and programs
+                                                  read-only
                                       vscode agent|you - who runs Claude Code and Codex in VS Code
                                       emblems on|off - closed / read-only emblems in Files
                                       notifications on|off - Files tells you about problems
@@ -27,7 +30,6 @@ folder or file, what it may do; the kernel enforces it with ACLs.
     safeai check [--fix]            verify (and repair) access, close new .env files
     safeai log [HOURS|all]          what the agent tried and was refused (default: 24 h)
     safeai setup                    apply all rules again
-    safeai update                   download the latest version and install it (asks for sudo)
     safeai --version
 
 Secret stores and .env files stay closed, places that run code as you (.git/hooks,
@@ -1088,25 +1090,67 @@ def version(path):
         return "?"
 
 
+SIGNERS = f"{LIB}/allowed_signers"  # the release key, pinned at install; root-owned
+
+
+def vtuple(v):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", v.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def pinned_key():
+    try:
+        with open(SIGNERS) as f:
+            return any(l.strip() and not l.startswith("#") for l in f)
+    except OSError:
+        return False
+
+
 def cmd_update():
-    """Fetch the latest version into a private temporary folder and run its installer
-    with the answers given last time. Your lists and the agent user stay."""
+    """Install a newer release, the way a package manager would: only a release tag
+    signed with the key recorded at install (a download cannot bring its own key),
+    only newer than what runs now; show who signed it and what changed, then ask."""
+    if not shutil.which("git") or not shutil.which("ssh-keygen"):
+        sys.exit("updating needs git and ssh-keygen (package openssh-client)")
+    if not pinned_key():
+        sys.exit(f"no release key was installed ({SIGNERS}); update by hand, see the README")
+    cur = version(f"{LIB}/VERSION")
     tmp = tempfile.mkdtemp(prefix="safeai-update-")  # mode 700: the agent cannot touch it
     try:
         src = f"{tmp}/src"
-        if shutil.which("git"):
-            r = subprocess.run(["git", "clone", "-q", "--depth", "1", REPO, src], stdin=subprocess.DEVNULL)
-        else:
-            os.makedirs(src)
-            r = subprocess.run(f"curl -fsSL {REPO}/archive/refs/heads/main.tar.gz | tar -xz -C {src} --strip-components=1",
-                               shell=True)
-        if r.returncode:
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        print(f"checking {REPO} ...", flush=True)
+        if subprocess.run(["git", "clone", "-q", "--no-checkout", REPO, src], stdin=subprocess.DEVNULL,
+                          env=env).returncode:
             sys.exit(f"could not download {REPO}")
-        cur, new = version(f"{LIB}/VERSION"), version(f"{src}/VERSION")
-        if cur == new:
+        tags = subprocess.run(["git", "-C", src, "tag", "--list", "v*"], capture_output=True, text=True).stdout.split()
+        newer = sorted((vtuple(t), t) for t in tags if vtuple(t) and vtuple(cur) and vtuple(t) > vtuple(cur))
+        if not newer:
             print(f"safeai {cur} is up to date")
             return
-        print(f"safeai {cur} -> {new}", flush=True)
+        tag = newer[-1][1]
+        git = ["git", "-C", src, "-c", f"gpg.ssh.allowedSignersFile={SIGNERS}"]
+        v = subprocess.run(git + ["verify-tag", tag], capture_output=True, text=True)
+        if v.returncode:
+            key = re.search(r"SHA256:\S+", v.stderr)
+            why = f"it is signed with another key ({key.group(0)})" if key else "it is not signed"
+            sys.exit(f"{tag}: {why}, not with the release key installed with safeai. Not installing.")
+        signer = next((l.strip() for l in v.stderr.splitlines() if l.startswith("Good")), "good signature")
+        subprocess.run(["git", "-C", src, "-c", "advice.detachedHead=false", "checkout", "-q", tag], check=True)
+        if version(f"{src}/VERSION") != tag[1:]:
+            sys.exit(f"{tag}: its VERSION file says {version(f'{src}/VERSION')}; not installing")
+        old = f"v{cur}" if f"v{cur}" in tags else None
+        log = subprocess.run(["git", "-C", src, "log", "--oneline", "--no-decorate", f"{old}..{tag}" if old else "-15",
+                              *([] if old else [tag])], capture_output=True, text=True).stdout.rstrip()
+        print(f"\nsafeai {cur} -> {tag[1:]}\n  {signer}\n\nChanges:\n" + "\n".join("  " + l for l in log.splitlines()))
+        if old:
+            print(f"Full diff: {REPO}/compare/{old}...{tag}")
+        try:
+            go = input(f"\nInstall safeai {tag[1:]}? It asks for your sudo password. [Y/n] ").strip().lower()
+        except EOFError:
+            go = "n"
+        if not sys.stdin.isatty() or go in ("n", "no"):
+            sys.exit("Nothing changed.")
         r = subprocess.run(["sudo", f"{src}/install.sh", "--update"])
         sys.exit(r.returncode)
     finally:
@@ -1122,7 +1166,7 @@ def vscode_on():
 
 
 SETTINGS = {  # name: (values, what it is)
-    "mode": (("relaxed", "strict"), "default for what you did not set"),
+    "mode": (("strict", "relaxed"), "default for what you did not set"),
     "vscode": (("agent", "you"), "who runs Claude Code and Codex in VS Code"),
     "emblems": (("on", "off"), "closed / read-only emblems in Files"),
     "notifications": (("on", "off"), "Files tells you about problems"),
@@ -1174,18 +1218,19 @@ def cmd_settings():
             cur = "-" if name in missing else setting(name)
             print(f"  {i}  {name:14} {cur:8} {'/'.join(values):15} {missing.get(name, what)}")
         print("  r  reset: drop all your rules, back to the mode's defaults (asks first)")
+        print("  u  update: install a newer signed release (shows what changes, asks first)")
         if not sys.stdin.isatty():
             return print("Change: safeai settings (in a terminal) or safeai settings set NAME VALUE")
         try:
-            n = input("Number to change, r to reset (Enter to quit): ").strip()
+            n = input("Number to change, r to reset, u to update (Enter to quit): ").strip()
         except EOFError:
             return print()
         if not n:
             return
-        if n.lower() == "r":
+        if n.lower() in ("r", "u"):
             print()
             try:
-                cmd_reset()
+                (cmd_reset if n.lower() == "r" else cmd_update)()
             except SystemExit as e:  # "Nothing changed" and the like: back to the menu
                 if e.code not in (None, 0):
                     print(e.code)
@@ -1241,14 +1286,14 @@ def main(a):
         return print(__doc__.strip())
     if a == ["--version"]:
         return print(version(f"{LIB}/VERSION"))
-    if a == ["update"]:
-        return cmd_update()
     if not a:
         return cmd_start()
     if a == ["status"]:
         return cmd_status()
     if a == ["settings"]:
         return cmd_settings()
+    if a == ["settings", "update"]:
+        return cmd_update()
     if len(a) == 4 and a[:2] == ["settings", "set"]:
         return cmd_setting_set(a[2], a[3])
     c = a[0]
@@ -1259,7 +1304,7 @@ def main(a):
     if c == "_auto" and len(a) == 1:
         return cmd_auto()
     if c == "init" and len(a) <= 2 and (len(a) == 1 or a[1] in ("strict", "relaxed")):
-        return cmd_init(a[1] if len(a) > 1 else "relaxed")
+        return cmd_init(a[1] if len(a) > 1 else "strict")
     if c == "check":
         return sys.exit(1 if cmd_check("--fix" in a) and "--fix" not in a else 0)
     if c == "log" and len(a) <= 2 and (len(a) == 1 or a[1] == "all" or a[1].isdigit()):

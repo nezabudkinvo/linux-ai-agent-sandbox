@@ -4,7 +4,7 @@ _safeai() {
     local cur=${COMP_WORDS[COMP_CWORD]} words
     case "$COMP_CWORD:${COMP_WORDS[1]}" in
         1:*) words="status settings ls open read close check log setup update --version --help" ;;
-        2:settings) words="set" ;;
+        2:settings) words="set update" ;;
         3:settings) words="mode vscode emblems notifications" ;;
         4:settings)
             case "${COMP_WORDS[3]}" in

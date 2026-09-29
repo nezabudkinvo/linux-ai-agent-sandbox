@@ -3,7 +3,7 @@
 # safeai from this checkout, run tests/check.sh.
 #
 #   tests/vm.sh up DISTRO      create and boot a VM (ubuntu, debian, fedora, arch)
-#   tests/vm.sh test DISTRO [relaxed|strict]
+#   tests/vm.sh test DISTRO [strict|relaxed]
 #                              fresh copy of this checkout, install with --yes, run the checks
 #   tests/vm.sh clean DISTRO   install, use and uninstall on a fresh VM; nothing may be left
 #   tests/vm.sh ssh DISTRO [CMD...]
@@ -29,9 +29,11 @@ SSH=(ssh -i "$KEY" -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=
      -o "SendEnv=-LC_* -LANG" tester@127.0.0.1)
 
 running() { [ -f "$VM/pid" ] && kill -0 "$(cat "$VM/pid")" 2>/dev/null; }
-stop() {  # power off and wait until the process is gone (the port is free again)
+stop() {  # shut down cleanly (a hard power-off can leave empty ssh host keys), then wait
     running || return 0
-    kill "$(cat "$VM/pid")"
+    "${SSH[@]}" -o ConnectTimeout=3 'sudo sync; sudo systemctl poweroff' >/dev/null 2>&1 || true
+    for _ in $(seq 120); do running || return 0; sleep 0.5; done
+    kill "$(cat "$VM/pid")"  # no clean shutdown within a minute
     while running; do sleep 0.5; done
 }
 
@@ -61,7 +63,8 @@ EOF
     running && { echo "$name is already running"; return; }
     qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -display none -daemonize -pidfile "$VM/pid" \
         -drive "file=$VM/disk.qcow2,if=virtio" -drive "file=$VM/seed.iso,media=cdrom" \
-        -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$port-:22"
+        -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$port-:22" \
+        -serial "file:$VM/console.log"  # the boot log, to see why a VM does not come up
     printf 'waiting for ssh'
     for _ in $(seq 90); do
         "${SSH[@]}" -o ConnectTimeout=2 true 2>/dev/null && { echo " ok"; "${SSH[@]}" cloud-init status --wait >/dev/null 2>&1 || true; return; }
@@ -78,7 +81,7 @@ case "$cmd" in
         # a folder for the checks, then a fresh copy of this checkout
         "${SSH[@]}" 'mkdir -p ~/Projects/demo && rm -rf ~/src && mkdir ~/src'
         tar --exclude=.git --exclude=__pycache__ -cf - . | "${SSH[@]}" 'tar -xf - -C ~/src'
-        "${SSH[@]}" "cd ~/src && sudo SAFEAI_MODE=${3:-relaxed} ./install.sh --yes && tests/check.sh"
+        "${SSH[@]}" "cd ~/src && sudo SAFEAI_MODE=${3:-strict} ./install.sh --yes && tests/check.sh"
         ;;
     clean)  # install, use, uninstall on a fresh VM; then compare with the state before
         stop; rm -rf "$VM"; up

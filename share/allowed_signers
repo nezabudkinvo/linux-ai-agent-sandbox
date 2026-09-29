@@ -1,0 +1,5 @@
+# The key that signs safeai releases (git tags). install.sh copies this file into
+# /usr/local/lib/safeai; `safeai settings update` installs only releases whose tag
+# verifies against that installed copy, never against a key from the download.
+# Format: see "ALLOWED SIGNERS" in ssh-keygen(1).
+nezabudkinvo namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF//4JpmHj56Y06oVY/ZtHmZ/VOLJckOTCMP15Py9TEY safeai release signing

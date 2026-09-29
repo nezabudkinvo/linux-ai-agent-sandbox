@@ -27,11 +27,11 @@ the author.
   agent uses.
 - For each folder or file you choose: **open** (the agent reads and writes),
   **read-only**, or **closed** (it cannot even see it).
-- Out of the box your folders are open, and only what must never leak or change
-  is protected: `.env` files, keys and passwords of other programs are closed;
-  your settings and the places code runs from (`~/.bashrc`, `~/bin`,
-  `.git/hooks`, ...) are read-only. Close anything else yourself. Or start from
-  the other end and let the agent see nothing but what you open.
+- Out of the box the agent sees nothing in your home: you open the project
+  folders it should work in (`safeai` offers it the first time). Or choose the
+  relaxed mode at install: your folders open, and only what must never leak or
+  change is protected (`.env` files, keys and passwords closed; settings and the
+  places code runs from, like `~/.bashrc`, `~/bin`, `.git`, read-only).
 - Your own `claude`, `codex` and VS Code keep working as you, exactly as before.
   The agent runs only where you ask for it: `safeai` opens a terminal as the
   agent; VS Code can be switched to it too.
@@ -57,6 +57,7 @@ $ safeai log                                 # what it tried and was refused
 ```
 git clone https://github.com/nezabudkinvo/linux-ai-agent-sandbox
 cd linux-ai-agent-sandbox
+git checkout v0.1.1     # the latest release; GitHub shows its tag as Verified (signed)
 ./install.sh --plan     # see every change first; nothing is modified, no sudo
 ./install.sh            # questions, the plan, then sudo for exactly that plan
 ```
@@ -71,8 +72,15 @@ be deleted afterwards.
 
 Check the result: `/usr/local/lib/safeai/check.sh` (as yourself).
 
-Update to the latest version: `safeai update` - it downloads it, keeps your
-rules and the answers you gave, and asks for your sudo password.
+Update: `safeai settings`, then `u` (or `safeai settings update`). It installs
+only a newer release signed with the project's key, which your installation
+recorded when you installed it; it shows who signed it and what changed, and asks
+before it runs the installer with sudo. Your rules and answers stay. By hand,
+in your clone: `git fetch --tags && git checkout vX.Y.Z`, read the changes, then
+`sudo ./install.sh --update`.
+
+Want to try it first without touching your system? `tests/vm.sh test ubuntu`
+runs it in a throwaway virtual machine.
 
 Remove: `sudo /usr/local/lib/safeai/uninstall.sh` - see
 [What the installer changes](#what-the-installer-changes).
@@ -82,8 +90,8 @@ Remove: `sudo /usr/local/lib/safeai/uninstall.sh` - see
 ```
 safeai                          a terminal as the agent, in this folder (offers to open it)
 safeai status                   mode and every rule you set
-safeai settings                 settings in a menu: mode, VS Code, Files; r there drops
-                                all your rules, back to the mode's defaults (asks first)
+safeai settings                 settings in a menu: mode, VS Code, Files; there, r drops
+                                all your rules, u installs a newer signed release (both ask)
 safeai ls [PATH]                what the agent can do with each entry here
 safeai open PATH...             the agent reads and writes
                                 (asks y/N first for settings and places that run code as you)
@@ -91,7 +99,6 @@ safeai read PATH...             the agent reads, cannot change
 safeai close PATH...            the agent can neither read nor enter
 safeai check [--fix]            verify and repair (runs every 5 minutes)
 safeai log [HOURS|all]          refused actions (with the audit option)
-safeai update                   install the latest version
 ```
 
 Run the agent:
@@ -119,10 +126,11 @@ to make the change yourself. The installer gives it these instructions
 
 For everything you did not set yourself (switch in `safeai settings`):
 
-- `relaxed` (the default): your folders are open, new ones too; hidden settings
-  and program folders like `~/bin` are read-only.
-- `strict`: the agent sees nothing in your home (not even its list of files)
-  until you open or allow reading something.
+- `strict` (the default): the agent sees nothing in your home (not even its
+  list of files) until you open or allow reading something.
+- `relaxed`: your folders are open, new ones too; hidden settings and program
+  folders like `~/bin` are read-only. Convenient, but everything you did not
+  close (`~/Documents` too) is open to the agent.
 
 In both modes:
 
@@ -141,7 +149,9 @@ In both modes:
 - files the agent creates in open folders become yours.
 
 The agent's network is not restricted: it uses the system's routing like any
-other program. It shares `localhost` with you: a dev server it starts opens in
+other program (the agents' own sandboxes, such as Claude Code's `/sandbox`,
+do not run inside safeai: they need to mount file systems, which safeai's
+AppArmor profile refuses). It shares `localhost` with you: a dev server it starts opens in
 your browser as usual, and services you run locally are reachable to it like to
 any user of the machine, so keep those behind a password.
 
@@ -200,7 +210,7 @@ Please read `install.sh` before you agree to its plan - it is short on purpose.
 
 ### Testing
 
-`tests/vm.sh test ubuntu [relaxed|strict]` (also `debian`, `arch`) boots a
+`tests/vm.sh test ubuntu [strict|relaxed]` (also `debian`, `arch`) boots a
 throwaway virtual machine (QEMU/KVM, no root needed), installs this checkout and
 runs the checks there. `tests/vm.sh clean ubuntu` installs, uses and removes
 safeai, then compares the machine with how it was before.

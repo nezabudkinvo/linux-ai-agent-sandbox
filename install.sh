@@ -6,7 +6,7 @@
 #   ./install.sh --plan         only show what would be changed
 #   sudo ./install.sh --yes     install with the defaults, no questions
 #   sudo ./install.sh --update  update an installed safeai with the answers given
-#                               last time (safeai update runs this)
+#                               last time (`safeai settings update` runs this)
 #   (sudo ./install.sh asks the same questions, already as root)
 #
 # Messages are English; SAFEAI_LANG=ru (or answering "ru" to the first question)
@@ -65,8 +65,8 @@ declare -A MSG=(
     [err_name]="bad user name: %s"
     [err_same]="the agent must be a separate user"
     [err_exists]="user %s already exists and was not created by safeai; choose another name"
-    [q_mode]="Default for your home: relaxed (your folders open, settings read-only, secrets closed) or strict (the agent sees nothing until you open it)"
-    [err_mode]="answer relaxed or strict"
+    [q_mode]="Default for your home: strict (the agent sees nothing until you open it) or relaxed (your folders open, settings read-only, secrets closed)"
+    [err_mode]="answer strict or relaxed"
     [q_apparmor]="AppArmor: refuse .env-like files to every agent process at open time"
     [q_audit]="Audit log of refused actions (safeai log; installs auditd, changes its log group)"
     [q_vscode]="VS Code: Claude Code and Codex always run as the agent (safeai settings switches back)"
@@ -133,7 +133,7 @@ fi
 rollback() {
     trap - ERR
     if [ "$MODE_ARG" = --update ]; then  # keep the working installation and your settings
-        echo "update failed; safeai keeps running with what is installed. Try again: safeai update" >&2
+        echo "update failed; safeai keeps running with what is installed. Try again: safeai settings update" >&2
         return
     fi
     m reverting >&2; echo >&2
@@ -205,7 +205,7 @@ if [ "$MODE_ARG" != --apply ]; then
 HOME_MODE=keep
 if [ $FIRST = yes ]; then
     ask HOME_MODE "$(m q_mode)" \
-        "${SAFEAI_MODE:-relaxed}"
+        "${SAFEAI_MODE:-strict}"
     case "$HOME_MODE" in strict|relaxed) ;; *) die "$(m err_mode)" ;; esac
 fi
 APPARMOR=no
@@ -331,7 +331,7 @@ printf '# safeai: %s may run programs as %s; there is no rule the other way roun
 visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "$(m err_sudoers)"; }
 put "$tmp" /etc/sudoers.d/safeai 440
 yn() { [ "$1" = yes ] && echo y || echo n; }
-repo=$(saved REPO)  # where `safeai update` downloads from (kept across updates)
+repo=$(saved REPO)  # where `safeai settings update` downloads from (kept across updates)
 printf 'OWNER=%s\nAGENT=%s\nLANG=%s\nAPPARMOR=%s\nAUDIT=%s\nVSCODE=%s\nNAUTILUS=%s\nREPO=%s\n' "$OWNER" "$AGENT" \
     "${LANG_CHOICE:-en}" "$(yn $APPARMOR)" "$(yn $AUDIT)" "$(yn $VSCODE)" "$(yn $NAUTILUS)" \
     "${repo:-https://github.com/nezabudkinvo/linux-ai-agent-sandbox}" >"$tmp"
@@ -347,6 +347,7 @@ put "$SRC/share/i18n/ru" "$LIB/i18n-ru" 644  # uninstall.sh speaks the language 
 put "$SRC/share/agent-shell.sh" "$LIB/agent-shell.sh" 644  # the agent's shell: how to install AI tools
 put "$SRC/tests/check.sh" "$LIB/check.sh" 755
 put "$SRC/VERSION" "$LIB/VERSION" 644
+put "$SRC/share/allowed_signers" "$LIB/allowed_signers" 644  # the release key updates must be signed with
 # Tab completion (bash-completion looks in /usr/local/share too)
 for d in /usr/local/share/bash-completion /usr/local/share/bash-completion/completions; do
     [ -d "$d" ] || { note "created-dir $d"; install -d -m 755 "$d"; }
@@ -428,7 +429,7 @@ if [ $APPARMOR = yes ]; then
     apparmor_parser -r /etc/apparmor.d/safeai-agent
     backup /etc/shells
     grep -qx "$LIB/safeai-shell" /etc/shells || echo "$LIB/safeai-shell" >>/etc/shells
-    usermod -s "$LIB/safeai-shell" "$AGENT"
+    [ "$(getent passwd "$AGENT" | cut -d: -f7)" = "$LIB/safeai-shell" ] || usermod -s "$LIB/safeai-shell" "$AGENT"
     drop=/etc/systemd/system/user@$(id -u "$AGENT").service.d
     [ -e "$drop/safeai.conf" ] || note "created-file $drop/safeai.conf"
     mkdir -p "$drop"

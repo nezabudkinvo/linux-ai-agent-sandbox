@@ -67,6 +67,23 @@ Both modes close the same secret stores and keep executable places read-only.
   and asks before deleting the agent user and the packages.
 - The sudo rule is checked with `visudo` before it is installed.
 
+## Updates
+
+`safeai settings update` works like a package manager's upgrade:
+
+- It installs only a git tag `vX.Y.Z` newer than the running version, and only if
+  the tag verifies against the release key that was installed with safeai
+  (`/usr/local/lib/safeai/allowed_signers`, root-owned). The key in the download
+  is never used, so a change pushed to the repository, or a compromised hosting
+  account, cannot produce an update your machine accepts; only the holder of the
+  signing key can.
+- The tag's `VERSION` must match its name; older or equal versions are refused.
+- The download goes to a private temporary folder (mode 700); the signer and the
+  list of changes are shown, and nothing runs with sudo before you say yes.
+- There are no automatic or background updates.
+- If the release key ever changes, updates stop with a clear message; install
+  the new version by hand after checking it.
+
 ## Known limits
 
 - Without AppArmor, an agent process watching a folder can race the guard: open
