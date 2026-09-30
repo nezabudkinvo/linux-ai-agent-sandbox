@@ -14,9 +14,12 @@ will only get more common.
 When an agent works under your own account, nothing can tell it apart from you.
 It reads everything you can read; an encrypted folder is open to it as soon as
 you unlock it; the "don't touch" rules in the agent's own settings do not bind
-the scripts it runs. Only the kernel can draw that line, and only between two
-users. So this project gives the agent its own Linux account and short commands
-to decide, folder by folder, what it may see and change.
+the scripts it runs. A line that holds has to come from the kernel: a sandbox
+around each program the agent starts, or a separate user. This project takes
+the second way, which covers everything the agent does (its terminal, VS Code
+extensions, MCP servers) and lets it keep working in your real folders. It gives
+the agent its own Linux account and short commands to decide, folder by folder,
+what it may see and change.
 
 The first version is managed from the terminal or from Files (Nautilus, the file
 manager of Ubuntu). A desktop app for it already exists and is being tested by
@@ -40,8 +43,9 @@ line holds whatever program the agent runs, which covers both its own mistakes
 and instructions hidden in a web page or a README it happens to read.
 
 It is not a jail: whatever you leave open to the agent, it can send out, like
-any program with network access. For code you do not trust at all, or data that
-must never leave the machine, use a virtual machine.
+any program with network access, and the agents' own network sandboxes (such as
+Claude Code's `/sandbox`) do not run inside safeai. For code you do not trust at
+all, or data that must never leave the machine, use a virtual machine.
 
 ## In short
 
