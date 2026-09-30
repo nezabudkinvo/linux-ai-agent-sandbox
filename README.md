@@ -2,16 +2,21 @@
 
 [README in Russian](README.ru.md)
 
+**Guard rails, not a jail:** your AI agent keeps working in your real folders,
+and the Linux kernel keeps it out of what you close.
+
 AI moves fast, and many people already let coding agents such as Claude Code or
 Codex work with everything on their computer. That speed brings a risk: an agent
 may read or use files you would rather keep to yourself, confidential ones
 included. Protecting them costs a little convenience, and tools like this one
 will only get more common.
 
-When an agent and its user work under the same account, the operating system
-cannot really tell them apart. So the simplest reliable protection, enforced by
-the kernel itself, is full separation: a separate account for the agent. This
-project sets that up for you and gives you short commands to manage it.
+When an agent works under your own account, nothing can tell it apart from you.
+It reads everything you can read; an encrypted folder is open to it as soon as
+you unlock it; the "don't touch" rules in the agent's own settings do not bind
+the scripts it runs. Only the kernel can draw that line, and only between two
+users. So this project gives the agent its own Linux account and short commands
+to decide, folder by folder, what it may see and change.
 
 The first version is managed from the terminal or from Files (Nautilus, the file
 manager of Ubuntu). A desktop app for it already exists and is being tested by
@@ -19,6 +24,24 @@ the author.
 
 > Status: early. Tested on fresh Ubuntu 24.04, Debian 12 and Arch Linux virtual
 > machines. [SECURITY.md](SECURITY.md) lists what it protects and what it does not.
+
+## Who it is for
+
+People who work with an AI agent every day and mostly trust it, but want some
+things kept out of its hands:
+
+- **what it must not read:** personal documents, keys, passwords, `.env` files;
+- **what it must not change:** your git settings and hooks, `~/.bashrc`, the
+  configs of your editor and other agents - everything that later runs as you.
+
+The agent keeps working in your real project folders, with its usual tools and
+network access: no containers, no copies of your projects, nothing to mount. The
+line holds whatever program the agent runs, which covers both its own mistakes
+and instructions hidden in a web page or a README it happens to read.
+
+It is not a jail: whatever you leave open to the agent, it can send out, like
+any program with network access. For code you do not trust at all, or data that
+must never leave the machine, use a virtual machine.
 
 ## In short
 
