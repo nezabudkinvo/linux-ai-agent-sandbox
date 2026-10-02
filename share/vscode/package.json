@@ -1,0 +1,38 @@
+{
+  "name": "safeai",
+  "displayName": "safeai",
+  "description": "Who runs your AI chats (the agent or you), and what the agent may touch.",
+  "publisher": "safeai",
+  "version": "0.2.6",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "main": "./extension.js",
+  "activationEvents": ["*"],
+  "contributes": {
+    "commands": [
+      { "command": "safeai.who", "title": "Switch this window's AI: agent / me", "category": "safeai" },
+      { "command": "safeai.open", "title": "Open (read and change)", "category": "AI agent" },
+      { "command": "safeai.read", "title": "Read only", "category": "AI agent" },
+      { "command": "safeai.close", "title": "Close", "category": "AI agent" },
+      { "command": "safeai.why", "title": "What can it do here?", "category": "AI agent" }
+    ],
+    "submenus": [{ "id": "safeai.explorer", "label": "AI agent" }],
+    "menus": {
+      "explorer/context": [{ "submenu": "safeai.explorer", "group": "7_modification@9" }],
+      "safeai.explorer": [
+        { "command": "safeai.open", "group": "1@1" },
+        { "command": "safeai.read", "group": "1@2" },
+        { "command": "safeai.close", "group": "1@3" },
+        { "command": "safeai.why", "group": "2@1" }
+      ],
+      "commandPalette": [
+        { "command": "safeai.open", "when": "false" },
+        { "command": "safeai.read", "when": "false" },
+        { "command": "safeai.close", "when": "false" },
+        { "command": "safeai.why", "when": "false" }
+      ]
+    }
+  }
+}

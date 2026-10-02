@@ -11,6 +11,8 @@
   there are not adopted: `safeai check` quarantines them.
 - A new folder directly in the home folder
   gets the mode's default (`safeai _auto`, run as the owner).
+- A secret store made after the install (~/.aws, ~/.config/gh, ...) is closed to
+  the agent the moment it appears, in both modes; `safeai check` then lists it.
 
 Everything is done through O_PATH descriptors: names in open folders come from
 the agent, so paths are never trusted twice.
@@ -22,6 +24,7 @@ import ctypes
 import os
 import pwd
 import re
+import select
 import stat
 import struct
 import subprocess
@@ -51,6 +54,14 @@ RESCAN = 600
 ENV_NAME = re.compile(rb"^(\.env(\..+)?|.+\.env)$")
 ENV_SAMPLE = re.compile(rb"[.-](example|sample|template|dist|defaults?)(\.env)?$", re.I)
 EXEC_NAMES = (".vscode", ".envrc", ".claude", ".codex", ".mcp.json")
+# places where programs keep keys and logins: the same list as SECRETS in bin/safeai
+SECRETS = (".ssh", ".gnupg", ".password-store", ".pki", ".netrc", ".git-credentials", ".pgpass",
+           ".npmrc", ".pypirc", ".docker", ".kube", ".aws", ".azure", ".config/gcloud", ".config/gh",
+           ".config/git", ".local/share/keyrings", ".mozilla", ".thunderbird", ".config/google-chrome",
+           ".config/chromium", ".config/BraveSoftware", ".config/Code", ".config/discord", ".config/evolution",
+           ".config/goa-1.0", ".claude", ".claude.json", ".codex", ".gemini", ".codeium", ".copilot", ".var",
+           ".vnc", ".cargo/credentials.toml", ".local/share/safeai-quarantine")
+SECRET_NAMES = {os.path.basename(x).encode() for x in SECRETS}
 
 libc = ctypes.CDLL(None, use_errno=True)
 libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
@@ -188,10 +199,64 @@ def scan_env():
             with_fd(p, lambda fd: close_env(fd, os.path.basename(p)))
 
 
+RULES_DIR = f"{HOME}/.config/safeai"
+
+
+def rule_lines(name):
+    try:
+        with open(f"{RULES_DIR}/{name}") as f:
+            return [l.rstrip("\n").rstrip("/") for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        return []
+
+
+def close_new_in_home(fd, name):
+    """strict: a file or hidden folder that appears directly in ~ is closed to the agent at
+    once (visible folders go to safeai _auto). Without this, a new ~/notes.txt readable by
+    others would stay readable by name until the next check. Listed paths are left to their rule."""
+    if (rule_lines("mode") or ["strict"])[0] != "strict":
+        return False
+    p = f"{HOME}/{name.decode(errors='surrogateescape')}"
+    if p in rule_lines("write-dirs") + rule_lines("read-only") + rule_lines("closed"):
+        return False
+    st = os.fstat(fd)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid == AGENT_UID:
+        return False
+    return subprocess.run(["setfacl", "-m", f"u:{AGENT}:---", f"/proc/{os.getpid()}/fd/{fd}"],
+                          capture_output=True).returncode == 0
+
+
+def close_secret_store(fd, dfd, name):
+    """A secret store that appears after the install (~/.aws, ~/.config/gh, ...) is closed to the agent
+    at once, in both modes, as the ones there at install are; `safeai check` then puts it in the closed
+    list. A rule of yours that opens that very path is left to itself."""
+    if name not in SECRET_NAMES:
+        return False
+    try:
+        p = f"{os.readlink(f'/proc/self/fd/{dfd}')}/{name.decode(errors='surrogateescape')}"
+    except OSError:
+        return False
+    if p not in {f"{HOME}/{x}" for x in SECRETS} or p in rule_lines("write-dirs") + rule_lines("read-only"):
+        return False
+    st = os.fstat(fd)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid == AGENT_UID:
+        return False
+    return subprocess.run(["setfacl", "-m", f"u:{AGENT}:---", f"/proc/{os.getpid()}/fd/{fd}"],
+                          capture_output=True).returncode == 0
+
+
+_autos = []
+
+
 def new_top_folder():
-    """A folder appeared in ~: let the owner's safeai decide (it keeps the lists)."""
-    subprocess.run(["runuser", "-u", OWNER, "--", "/usr/local/bin/safeai", "_auto"],
-                   capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+    """A folder appeared in ~: let the owner's safeai decide (it keeps the lists). In the
+    background: applying the rules to a big folder takes time, and this loop must keep
+    closing new .env files meanwhile."""
+    _autos[:] = [p for p in _autos if p.poll() is None]
+    if len(_autos) < 4:  # a burst of new folders: the running ones see them all
+        _autos.append(subprocess.Popen(["runuser", "-u", OWNER, "--", "/usr/local/bin/safeai", "_auto"],
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL))
 
 
 def with_fd(path, fn):
@@ -233,10 +298,15 @@ def watch():
     scan()
     scan_env()
     last = time.monotonic()
+    waiting = select.poll()
+    waiting.register(fan, select.POLLIN)
     while True:
         if time.monotonic() - last > RESCAN:
             scan()
             last = time.monotonic()
+        # the rescan is due on time, also when nothing happens on the disk
+        if not waiting.poll(max(0.0, RESCAN - (time.monotonic() - last)) * 1000 + 1000):
+            continue
         dirs = work_dirs()
         buf = os.read(fan, 65536)
         pos = 0
@@ -260,15 +330,19 @@ def watch():
                     dfd = libc.open_by_handle_at(mount_fd, handle, O_PATH | os.O_DIRECTORY)
                     if dfd >= 0:
                         try:
-                            if mask & FAN_ONDIR and name and not name.startswith(b"."):
-                                st = os.fstat(dfd)
-                                if (st.st_dev, st.st_ino) == (home.st_dev, home.st_ino):
-                                    new_top_folder()
+                            dst = os.fstat(dfd)
+                            in_home = (dst.st_dev, dst.st_ino) == (home.st_dev, home.st_ino)
+                            visible_dir = mask & FAN_ONDIR and name and not name.startswith(b".")
+                            if visible_dir and in_home:
+                                new_top_folder()
                             if name and name not in (b".", b".."):
                                 fd = os.open(name, O_PATH | os.O_NOFOLLOW, dir_fd=dfd)
                                 try:
                                     close_env(fd, name)
                                     close_exec(fd)
+                                    if in_home and not visible_dir:
+                                        close_new_in_home(fd, name)
+                                    close_secret_store(fd, dfd, name)
                                     adopt(fd, dirs)
                                 finally:
                                     os.close(fd)

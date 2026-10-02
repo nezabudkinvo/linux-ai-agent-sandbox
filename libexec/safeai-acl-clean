@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""safeai-acl-clean OWNER AGENT - undo what safeai did to the permissions of OWNER's
+"""safeai-acl-clean OWNER AGENT [PROGRESS] - undo what safeai did to the permissions of OWNER's
 home folder (uninstall.sh runs it as root, after the agent's processes are gone).
 
 - removes the ACL entries safeai added (for AGENT and OWNER, access and default);
@@ -8,97 +8,159 @@ home folder (uninstall.sh runs it as root, after the agent's processes are gone)
 - files the agent created carry its group (the "agent made" mark) or, in a few
   places, its user: they get OWNER and OWNER's group.
 ACLs other programs or people set are left alone.
+
+One pass over the home folder; the ACLs are edited in place (no program per file), so a
+home with millions of files takes seconds to a few minutes. PROGRESS: a printf format with
+two %d (files seen, files changed), shown on a terminal while it runs.
 """
 import os
 import pwd
 import stat
 import struct
-import subprocess
 import sys
+import time
 
 owner, agent = pwd.getpwnam(sys.argv[1]), pwd.getpwnam(sys.argv[2])
+PROGRESS = sys.argv[3] if len(sys.argv) > 3 else "%d files, %d changed"
 OWNER_UID, OWNER_GID, HOME = owner.pw_uid, owner.pw_gid, owner.pw_dir
 AGENT_UID, AGENT_GID = agent.pw_uid, agent.pw_gid
-USER, GROUP = 0x02, 0x08  # named entries; the rest are base entries and the mask
+ACCESS, DEFAULT = "system.posix_acl_access", "system.posix_acl_default"
+USER_OBJ, USER, GROUP_OBJ, GROUP, MASK = 0x01, 0x02, 0x04, 0x08, 0x10  # named entries: USER, GROUP
+MINE = (AGENT_UID, OWNER_UID)  # safeai's default ACL also names the owner; new files inherit it
 
 
-def entries(path, name, perms=False):
+def entries(path, name):
     try:
         raw = os.getxattr(path, name, follow_symlinks=False)
     except OSError:
         return None
-    items = list(struct.iter_unpack("<HHI", raw[4:]))
-    return items if perms else [(tag, uid) for tag, _perm, uid in items]
+    return list(struct.iter_unpack("<HHI", raw[4:]))
 
 
-def effective_group(path):
-    """Group permissions to keep: group entry & mask, and never more than the
-    owner has. Files created under safeai's default ACL inherit the folder's group
-    entry (rwx on a 775 folder); without the cap a new 664 file would end up 674."""
-    items = entries(path, "system.posix_acl_access", perms=True) or []
-    group = next((p for t, p, _ in items if t == 0x04), None)
-    mask = next((p for t, p, _ in items if t == 0x10), 7)
-    owner = next((p for t, p, _ in items if t == 0x01), 7)
-    return None if group is None else group & mask & owner
+def ours(items):
+    return any(t == USER and u in MINE for t, _p, u in items or [])
 
 
-def plan(path):
-    """setfacl arguments that undo safeai on path (empty: nothing to do)."""
-    acc = entries(path, "system.posix_acl_access") or []
-    dfl = entries(path, "system.posix_acl_default")
-    mine = (AGENT_UID, OWNER_UID)  # safeai's default ACL also names the owner; new files inherit it
-    ours_acc = [u for t, u in acc if t == USER and u in mine]
-    ours_dfl = [u for t, u in (dfl or []) if t == USER and u in mine]
-    if not ours_acc and not ours_dfl:
-        return []
-    others_acc = any(t in (USER, GROUP) and not (t == USER and u in mine) for t, u in acc)
-    others_dfl = any(t in (USER, GROUP) and not (t == USER and u in mine) for t, u in (dfl or []))
-    if not others_acc and not others_dfl:
-        return [["-b"]]  # only safeai's entries: back to the plain mode
-    cmds = [["-x", f"u:{u}"] for u in ours_acc]
-    if dfl is not None and ours_dfl:
-        if others_dfl:
-            cmds += [["-x", f"d:u:{u}"] for u in ours_dfl]
-        else:
-            cmds.append(["-k"])
-    return cmds
+def without_ours(items):
+    """The ACL without safeai's entries, its mask recomputed as setfacl does; None when no named
+    entry is left (the plain mode is enough)."""
+    rest = [e for e in items if not (e[0] == USER and e[2] in MINE)]
+    if not any(t in (USER, GROUP) for t, _p, _u in rest):
+        return None
+    mask = 0
+    for t, p, _u in rest:
+        if t in (USER, GROUP_OBJ, GROUP):
+            mask |= p
+    return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, mask if t == MASK else p, u)
+                                           for t, p, u in rest)
+
+
+def own_default(items, acc, st):
+    """A default ACL left with no named entry that the owner set to shape new files: it differs from
+    what setfacl builds from the folder's own permissions (acc, or the mode). A restrictive default
+    (d:other::---) differs and stays; a default equal to the folder's permissions is one safeai made
+    by adding its entry, and goes. Keeps the owner's choices for new files, not safeai's leftovers."""
+    acc = acc or [(USER_OBJ, (st.st_mode >> 6) & 7, 0), (GROUP_OBJ, (st.st_mode >> 3) & 7, 0),
+                  (0x20, st.st_mode & 7, 0)]
+    base = lambda e: {t: p for t, p, _ in e if t in (USER_OBJ, GROUP_OBJ, 0x20)}
+    return base([e for e in items if e[0] != USER]) != base(acc)
+
+
+def effective_group(items):
+    """Group permissions to keep: group entry & mask, and never more than the owner has.
+    Files created under safeai's default ACL inherit the folder's group entry (rwx on a 775
+    folder); without the cap a new 664 file would end up 674."""
+    group = next((p for t, p, _ in items if t == GROUP_OBJ), None)
+    mask = next((p for t, p, _ in items if t == MASK), 7)
+    user = next((p for t, p, _ in items if t == USER_OBJ), 7)
+    return None if group is None else group & mask & user
 
 
 def fix(path, st):
-    steps = plan(path)
-    group = effective_group(path) if ["-b"] in steps else None
-    for args in steps:
-        subprocess.run(["setfacl", *args, "--", path], capture_output=True)
-    if group is not None:
-        # setfacl -b puts the ACL's group entry into the mode; the mask could be
-        # narrower (files created under safeai's default ACL): keep what ls showed
-        mode = stat.S_IMODE(os.lstat(path).st_mode)
-        os.chmod(path, (mode & ~0o070) | (group << 3))
+    """Undo safeai on path; True if anything changed."""
+    changed = False
+    acc = entries(path, ACCESS)
+    if ours(acc):
+        left = without_ours(acc)
+        if left is None:  # only safeai's entries: back to the plain mode, with the group it showed
+            group = effective_group(acc)
+            os.removexattr(path, ACCESS, follow_symlinks=False)
+            if group is not None:
+                os.chmod(path, (stat.S_IMODE(st.st_mode) & ~0o070) | (group << 3))
+        else:
+            os.setxattr(path, ACCESS, left, follow_symlinks=False)
+        changed = True
+    if stat.S_ISDIR(st.st_mode):
+        dfl = entries(path, DEFAULT)
+        if ours(dfl):
+            left = without_ours(dfl)
+            if left is None and own_default(dfl, acc, st):  # the owner's own, not one safeai made: keep it
+                left = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in dfl
+                                                       if not (e[0] == USER and e[2] in MINE))
+            if left is None:
+                os.removexattr(path, DEFAULT, follow_symlinks=False)
+            else:
+                os.setxattr(path, DEFAULT, left, follow_symlinks=False)
+            changed = True
     if st.st_uid == AGENT_UID or st.st_gid == AGENT_GID:
         os.chown(path, OWNER_UID, OWNER_GID, follow_symlinks=False)
+        changed = True
+    return changed
 
 
 def main():
+    tty = sys.stdout.isatty()
+    seen = changed = 0
+    failed = []
+    shown = time.monotonic()
+
+    def show(end=""):
+        print(f"\r  {PROGRESS % (seen, changed)}", end=end, flush=True)
+
     root_dev = os.lstat(HOME).st_dev
-    fix(HOME, os.lstat(HOME))
-    for d, subdirs, files in os.walk(HOME):
-        keep = []
-        for name in subdirs + files:
-            p = os.path.join(d, name)
+    changed += fix(HOME, os.lstat(HOME))
+    stack = [HOME]
+    while stack:
+        d = stack.pop()
+        try:
+            it = list(os.scandir(d))
+        except OSError as e:
+            failed.append((d, e.strerror))
+            continue
+        for e in it:
             try:
-                st = os.lstat(p)
+                st = e.stat(follow_symlinks=False)
             except OSError:
                 continue
+            seen += 1
             if stat.S_ISLNK(st.st_mode):
                 if st.st_uid == AGENT_UID or st.st_gid == AGENT_GID:
-                    os.chown(p, OWNER_UID, OWNER_GID, follow_symlinks=False)
+                    try:
+                        os.chown(e.path, OWNER_UID, OWNER_GID, follow_symlinks=False)
+                        changed += 1
+                    except OSError as x:
+                        failed.append((e.path, x.strerror))
                 continue
             if st.st_dev != root_dev:
                 continue
-            fix(p, st)
-            if name in subdirs:
-                keep.append(name)
-        subdirs[:] = keep
+            try:
+                changed += fix(e.path, st)
+            except OSError as x:
+                failed.append((e.path, x.strerror))
+            if stat.S_ISDIR(st.st_mode):
+                stack.append(e.path)
+        if tty and time.monotonic() - shown > 0.5:
+            shown = time.monotonic()
+            show()
+    if tty:
+        show("\n")
+    if failed:  # left as they were: say where, so it can be finished by hand
+        for p, why in failed[:10]:
+            print(f"  not cleaned: {p}: {why}", file=sys.stderr)
+        if len(failed) > 10:
+            print(f"  ... and {len(failed) - 10} more", file=sys.stderr)
+        print(f"  by hand: sudo setfacl -x u:{AGENT_UID} PATH (and -x d:u:{AGENT_UID} for a folder)", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,19 @@
 """Nautilus extension for safeai (optional).
 
-Right click a file or folder: "AI agent: open / read-only / close".
-Emblems show what the agent can really do: a cross - no access, an eye - read only
-(turn them off in `safeai settings`).
+Right click a file or folder: "AI agent: open / read-only / close", under a greyed line saying
+what it is now ("Now: open, something closed inside").
+Emblems show what the agent can do with that very item: red - closed, blue eye - read only,
+no emblem - it reads and writes. A two-color emblem reads left to right: the left half is the
+folder itself, the right half something inside it. Red | green: a closed folder where the agent
+reaches only what you opened inside. Green | red: an open folder with something you closed
+inside (at any depth); blue | red: the same in a read-only folder. .env files that safeai closes
+by itself do not count: there is one in almost every project, with its own red emblem. Turn
+emblems off in `safeai settings`.
 Actions call the `safeai` command. Installed into
 ~/.local/share/nautilus-python/extensions/ (needs the nautilus-python package).
 """
 import os
+import re
 import pwd
 import shutil
 import struct
@@ -17,7 +24,13 @@ HOME = os.path.expanduser("~")
 SAFEAI = shutil.which("safeai") or "/usr/local/bin/safeai"
 CONF = f"{HOME}/.config/safeai"
 LISTS = {"closed": f"{CONF}/closed", "read": f"{CONF}/read-only", "work": f"{CONF}/write-dirs"}
-EMBLEMS = {"none": "emblem-unreadable", "read": "view-reveal-symbolic"}
+EMBLEMS = {"none": "safeai-closed", "read": "safeai-readonly", "pass": "safeai-partly",
+           "full+closed": "safeai-open-closed", "read+closed": "safeai-read-closed"}
+if not os.path.exists(f"{HOME}/.local/share/icons/hicolor/scalable/emblems/safeai-open-closed.svg"):
+    EMBLEMS = {"none": "emblem-unreadable", "read": "view-reveal-symbolic", "pass": "emblem-important",
+               "full+closed": "emblem-important", "read+closed": "emblem-important"}
+SAMPLES = ("example", "sample", "template", "dist", "default", "defaults")
+PROFILE = os.path.exists("/etc/apparmor.d/safeai-agent")
 
 
 def _agent():
@@ -85,7 +98,9 @@ def agent_bits(path):
 
 
 def agent_access(path):
-    """none / read / full, walking the search (x) right on every parent."""
+    """none / pass / read / full: what the agent can do with path itself, from the permissions
+    (with the search right on every parent) and the AppArmor profile, which refuses .env-like
+    names whatever the permissions (the same names as bin/safeai profile_refuses)."""
     if AGENT_UID is None:
         return "full"
     d = os.path.dirname(path)
@@ -95,10 +110,74 @@ def agent_access(path):
         if d == "/":
             break
         d = os.path.dirname(d)
+    n = os.path.basename(path)
+    if PROFILE and (n.endswith(".env") or (n.startswith(".env.") and len(n) > 5 and n[5:] not in SAMPLES)):
+        return "none"
     bits = agent_bits(path)
-    if not bits & 4 or (os.path.isdir(path) and not bits & 1):
+    if bits & 2 and (bits & 1 or not os.path.isdir(path)):
+        return "full"  # it can change it, whether it can read it or not
+    if os.path.isdir(path):
+        if not bits & 1:
+            return "none"
+        if not bits & 4:
+            return "pass"  # it can go through to what is open inside, not list it
+    elif not bits & 4:
         return "none"
     return "full" if bits & 2 else "read"
+
+
+# .env-like names safeai closes by itself (the same as bin/safeai is_env)
+ENV_NAME = re.compile(r"^(\.env(\..+)?|.+\.env)$")
+ENV_SAMPLE = re.compile(r"[.-](example|sample|template|dist|defaults?)(\.env)?$", re.I)
+_closed = {"mtime": None, "dirs": {}}
+
+
+def is_env(p):
+    n = os.path.basename(p)
+    return bool(ENV_NAME.match(n)) and not ENV_SAMPLE.search(n)
+
+
+def closed_inside(path):
+    """Whether a rule of yours in the closed list closes something inside folder path, at any depth.
+    The list is read again when it changes; .env files are left out (safeai closes them by itself,
+    there is one in almost every project), and so are rules for paths that are gone."""
+    try:
+        mtime = os.stat(LISTS["closed"]).st_mtime_ns
+    except OSError:
+        return False
+    if mtime != _closed["mtime"]:
+        dirs = {}
+        try:
+            with open(LISTS["closed"]) as f:
+                for line in f:
+                    q = line.strip().rstrip("/")
+                    if not q.startswith(HOME + "/") or is_env(q):
+                        continue
+                    d = os.path.dirname(q)
+                    while d.startswith(HOME + "/"):
+                        dirs.setdefault(d, []).append(q)
+                        d = os.path.dirname(d)
+        except OSError:
+            pass
+        _closed.update(mtime=mtime, dirs=dirs)
+    return any(os.path.lexists(q) for q in _closed["dirs"].get(path, ()))
+
+
+def emblem_of(path):
+    """The emblem for path (a key of EMBLEMS), or None for open with nothing closed inside."""
+    acc = agent_access(path)
+    if acc in ("full", "read") and os.path.isdir(path) and closed_inside(path):
+        return f"{acc}+closed"
+    return None if acc == "full" else acc
+
+
+NOW = {None: "open", "read": "read-only", "none": "closed", "pass": "closed, something open inside",
+       "full+closed": "open, something closed inside", "read+closed": "read-only, something closed inside"}
+
+
+def status_of(path):
+    """The greyed line above the actions: what the agent can do with path now, as its emblem says."""
+    return f"Now: {NOW[emblem_of(path)]}"
 
 
 def listed():
@@ -141,13 +220,31 @@ class SafeAIExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProvi
     def __init__(self):
         super().__init__()
         self.emblems = emblems_on()  # read once; changing it in safeai settings restarts Files
+        # a rule set from the terminal changes a folder's emblem without touching the folder itself:
+        # the folders shown are refreshed when your lists change
+        self.shown = {}
+        try:
+            self.monitor = Gio.File.new_for_path(CONF).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            self.monitor.connect("changed", self.rules_changed)
+        except Exception:  # no lists yet: emblems refresh as Files shows the folders again
+            self.monitor = None
+
+    def rules_changed(self, _monitor, f, _other, _event):
+        if f.get_basename() in ("closed", "read-only", "write-dirs"):
+            for info in list(self.shown.values()):
+                info.invalidate_extension_info()
 
     def update_file_info(self, info):
         p = home_path(info) if self.emblems else None
         if p:
-            acc = agent_access(p)
-            if acc != "full":
-                info.add_emblem(EMBLEMS[acc])
+            e = emblem_of(p)
+            if e:
+                info.add_emblem(EMBLEMS[e])
+            if info.is_directory():
+                self.shown.pop(p, None)
+                self.shown[p] = info
+                if len(self.shown) > 5000:
+                    self.shown.pop(next(iter(self.shown)))
         return Nautilus.OperationResult.COMPLETE
 
     def get_file_items(self, files):
@@ -156,14 +253,23 @@ class SafeAIExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProvi
             return []
         modes = listed()
         cur = [modes.get(p) for p in paths]
+        # an action on a folder covers everything in it, your rules inside included: worth offering
+        # even when the folder itself already has that state (.env files are not rules of yours)
+        inner = any(q.startswith(p + "/") and not is_env(q) for p in paths for q in modes)
+        folder = any(os.path.isdir(p) for p in paths)
+        everything = " everything in it" if folder else ""
         items = []
-        # offer what changes something for at least one of the selected paths
-        if any(m != "work" for m in cur):
-            items.append(self.item("open", "AI agent: open", "The agent may read and write", files, paths))
-        if any(m != "read" for m in cur):
-            items.append(self.item("read", "AI agent: read-only", "The agent reads but cannot change", files, paths))
-        if any(m != "closed" for m in cur):
-            items.append(self.item("close", "AI agent: close", "The agent can neither read nor enter", files, paths))
+        now = {status_of(p) for p in paths} if AGENT_UID is not None else set()
+        if len(now) == 1:  # none for a selection of items that differ
+            items.append(Nautilus.MenuItem(name="SafeAI::now", label=now.pop(), sensitive=False))
+        if inner or any(m != "work" for m in cur):
+            items.append(self.item("open", "AI agent: open", f"The agent may read and write{everything}", files, paths))
+        if inner or any(m != "read" for m in cur):
+            items.append(self.item("read", "AI agent: read-only", f"The agent reads{everything}, cannot change it",
+                                   files, paths))
+        if inner or any(m != "closed" for m in cur):
+            items.append(self.item("close", "AI agent: close", f"The agent can neither read nor enter{everything}",
+                                   files, paths))
         return items
 
     def item(self, action, label, tip, files, paths):

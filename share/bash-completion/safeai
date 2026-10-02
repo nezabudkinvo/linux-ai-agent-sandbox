@@ -3,7 +3,8 @@
 _safeai() {
     local cur=${COMP_WORDS[COMP_CWORD]} words
     case "$COMP_CWORD:${COMP_WORDS[1]}" in
-        1:*) words="status settings ls open read close check log setup update --version --help" ;;
+        1:*) words="claude codex status settings me ls why open read close check log setup --version --help" ;;
+        2:me) words="once off 15 30 60" ;;
         2:settings) words="set update" ;;
         3:settings) words="mode vscode emblems notifications" ;;
         4:settings)
@@ -12,8 +13,9 @@ _safeai() {
                 emblems | notifications) words="on off" ;;
             esac ;;
         2:check) words="--fix" ;;
-        2:log) words="all" ;;
-        *:open | *:read | *:close | *:ls) return ;;  # paths: the default completion
+        2:log) words="all review" ;;
+        3:log) [ "${COMP_WORDS[2]}" = review ] && words="all" ;;
+        *:open | *:read | *:close | *:ls | *:why | *:claude | *:codex) return ;;  # paths: the default completion
         *) words="" ;;
     esac
     compopt +o default 2>/dev/null  # only these words here, not file names

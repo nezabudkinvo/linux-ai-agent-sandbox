@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- safeai: read-only to the AI agent, with something you closed inside (left: the folder, right: inside) -->
+  <path d="M8 0.5A7.5 7.5 0 0 0 8 15.5z" fill="#1565c0"/>
+  <path d="M8 0.5A7.5 7.5 0 0 1 8 15.5z" fill="#c62828"/>
+  <path d="M1.9 8C2.8 6.5 3.8 5.8 4.9 5.8S7 6.5 7.6 8C7 9.5 6 10.2 4.9 10.2S2.8 9.5 1.9 8z" fill="#ffffff"/>
+  <circle cx="4.9" cy="8" r="1.1" fill="#1565c0"/>
+  <rect x="9" y="6.75" width="4.4" height="2.5" rx="0.5" fill="#ffffff"/>
+</svg>

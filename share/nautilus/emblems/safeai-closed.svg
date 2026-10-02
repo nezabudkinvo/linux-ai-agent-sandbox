@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- safeai: closed to the AI agent -->
+  <circle cx="8" cy="8" r="7.5" fill="#c62828"/>
+  <rect x="3.5" y="6.75" width="9" height="2.5" rx="0.6" fill="#ffffff"/>
+</svg>

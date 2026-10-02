@@ -1,8 +1,11 @@
 #!/bin/sh
-# safeai-run COMMAND [ARGS...] - run COMMAND as the agent user, in the current folder.
-# Used by `safeai` (the agent's terminal) and, after `safeai settings set vscode agent`, by VS Code (Claude Code's
-# claudeProcessWrapper passes the claude binary as COMMAND; Codex goes through
-# safeai-codex). A folder closed to the agent is refused, never run as you.
+# safeai-run COMMAND [ARGS...] - what VS Code runs: Claude Code's claudeProcessWrapper passes the
+#   claude binary as COMMAND, Codex comes through safeai-codex. safeai decides who runs it
+#   (safeai _vscode): the agent, or you as the status bar switch says; then it comes back here.
+# safeai-run --agent COMMAND [ARGS...] - COMMAND as the agent user, in the current folder
+#   (`safeai` uses it too). A folder closed to the agent is refused, never run as you.
+[ "${1:-}" = --agent ] || exec /usr/local/bin/safeai _vscode "$@"
+shift
 AGENT=$(sed -n 's/^AGENT=//p' /etc/safeai.conf 2>/dev/null); AGENT=${AGENT:-aiagent}
 cwd=$(pwd -P)
 
@@ -13,16 +16,23 @@ fi
 AGENT_HOME=$(getent passwd "$AGENT" | cut -d: -f6)
 exec sudo -n -u "$AGENT" --preserve-env -- /bin/sh -c '
 umask 002
-home=$0  # $0 is the agent home, "$@" the command
+# $0 is the agent home, "$@" the command
 # AppArmor profile if installed; if it is installed but not loaded, this fails closed
 [ -e /etc/apparmor.d/safeai-agent ] && set -- /usr/bin/aa-exec -p safeai-agent -- "$@"
-# none of your session or secrets: sockets, askpass helpers, tokens, keys
-for v in $(env | sed -n "s/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p"); do
+# only what a terminal and the AI tools need passes: your session, its sockets, tokens,
+# connection strings (DATABASE_URL, ...) and everything else stay with you. The names come from awk,
+# not from the lines of env: a value runs over several lines (sudo puts this whole script in SUDO_COMMAND)
+for v in $(awk "BEGIN { for (k in ENVIRON) if (k ~ /^[A-Za-z_][A-Za-z0-9_]*\$/) print k }"); do
     case "$v" in
-        *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*API_KEY*|*_KEY|GIT_*|GH_*|GITHUB_*|AWS_*|AZURE_*|GOOGLE_*|\
-        OPENAI_*|ANTHROPIC_*|SSH_*|GPG_*|GNUPGHOME|VSCODE_GIT_*|VSCODE_IPC_HOOK*|XDG_RUNTIME_DIR|\
-        DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|DISPLAY|XAUTHORITY|BROWSER) unset "$v" ;;
+        *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*CREDENTIAL*|*API_KEY*|*_KEY) unset "$v" ;;
+        PATH|LANG|LANGUAGE|LC_*|TZ|TERM|COLORTERM|TERM_PROGRAM|TERM_PROGRAM_VERSION|NO_COLOR|FORCE_COLOR|COLUMNS|LINES|\
+        EDITOR|VISUAL|PAGER|CLAUDE_*|CLAUDECODE|MCP_*|DISABLE_*|ENABLE_*|CODEX_*|RUST_LOG|\
+        SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE) ;;
+        http_proxy|https_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)
+            eval "val=\${$v}"
+            case "$val" in *@*) unset "$v" ;; esac ;;  # a proxy with a login stays yours
+        *) unset "$v" ;;
     esac
 done
-exec env HOME="$home" USER="$(id -un)" LOGNAME="$(id -un)" PATH="$home/.local/bin:$home/bin:$PATH" "$@"
+exec env HOME="$0" USER="$(id -un)" LOGNAME="$(id -un)" SHELL=/bin/bash PATH="$0/.local/bin:$0/bin:$PATH" "$@"
 ' "$AGENT_HOME" "$@"

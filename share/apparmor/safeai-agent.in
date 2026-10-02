@@ -1,11 +1,24 @@
 # safeai: processes of the AI agent user. Everything is allowed except files with
 # secret-looking names (.env and friends) outside /tmp and /dev/shm, which are
-# refused at open time. mount and change_profile are not allowed.
+# refused at open time, and git repositories in the owner's home, which the agent may
+# neither move nor create. mount and change_profile are not allowed.
 abi <abi/@ABI@>,
 include <tunables/global>
 
 @{SAFEAI_DENY}=/home /root /etc /srv /opt /usr /mnt /media /snap /var /data /boot /run /lib /lib64 /bin /sbin
-@{SECRET}=.env .env.local .env.*.local .env.prod .env.production .env.dev .env.development .env.stage .env.staging .env.test .env.testing *.env
+@{OWNER_HOME}="@OWNERHOME@"
+# .env and NAME.env, and every .env.SOMETHING except the samples (.env.example, .sample,
+# .template, .dist, .default, .defaults): AppArmor has no exceptions, so the names around
+# each sample are spelled out letter by letter (.env.e, .env.e[^x]*, .env.ex, ...)
+@{SECRET}=.env *.env .env.[^dest]* .env.d .env.d[^ei]* .env.de .env.de[^f]* .env.def .env.def[^a]*
+@{SECRET}+=.env.defa .env.defa[^u]* .env.defau .env.defau[^l]* .env.defaul .env.defaul[^t]*
+@{SECRET}+=.env.default[^s]* .env.defaults?* .env.di .env.di[^s]* .env.dis .env.dis[^t]* .env.dist?*
+@{SECRET}+=.env.e .env.e[^x]* .env.ex .env.ex[^a]* .env.exa .env.exa[^m]* .env.exam .env.exam[^p]*
+@{SECRET}+=.env.examp .env.examp[^l]* .env.exampl .env.exampl[^e]* .env.example?* .env.s .env.s[^a]*
+@{SECRET}+=.env.sa .env.sa[^m]* .env.sam .env.sam[^p]* .env.samp .env.samp[^l]* .env.sampl
+@{SECRET}+=.env.sampl[^e]* .env.sample?* .env.t .env.t[^e]* .env.te .env.te[^m]* .env.tem
+@{SECRET}+=.env.tem[^p]* .env.temp .env.temp[^l]* .env.templ .env.templ[^a]* .env.templa
+@{SECRET}+=.env.templa[^t]* .env.templat .env.templat[^e]* .env.template?*
 
 profile safeai-agent flags=(attach_disconnected,mediate_deleted) {
   /{,**} mrwlkix,
@@ -21,4 +34,8 @@ profile safeai-agent flags=(attach_disconnected,mediate_deleted) {
   audit deny @{SAFEAI_DENY}/**/@{SECRET} mrwlkx,
   # a hard link to a secret under another name
   audit deny link /** -> @{SAFEAI_DENY}/**/@{SECRET},
+  # every repository in the owner's home is the owner's: the agent can neither rename a .git
+  # aside nor create one (a .git of its own there would point the owner's git at its settings).
+  # Writing inside the owner's .git is refused by the ACLs already.
+  audit deny @{OWNER_HOME}/**/.git{,/} w,
 }

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- safeai: partly open - the AI agent reaches only what you opened inside -->
+  <path d="M8 0.5A7.5 7.5 0 0 0 8 15.5z" fill="#c62828"/>
+  <path d="M8 0.5A7.5 7.5 0 0 1 8 15.5z" fill="#2e7d32"/>
+  <rect x="2.6" y="6.75" width="4.4" height="2.5" rx="0.5" fill="#ffffff"/>
+  <path d="M9.4 8.2l1.5 1.5 2.7-3" stroke="#ffffff" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,109 @@
+#!/usr/bin/python3 -I
+"""safeai-explain - tells the agent why it was refused (a Claude Code hook).
+
+Registered in the agent's ~/.claude/settings.json for PostToolUseFailure. When a tool
+fails with "Permission denied" on a path in the owner's home, it adds a short note for
+the model: which kind of place it is and what to ask the owner, so the agent asks
+instead of trying other ways in. It runs as the agent and knows only what the agent can
+see: names and its own access. Anything else: no output.
+"""
+import json
+import os
+import re
+import shlex
+import sys
+
+ENV_NAME = re.compile(r"^(\.env(\..+)?|.+\.env)$")
+ENV_SAMPLE = re.compile(r"[.-](example|sample|template|dist|defaults?)(\.env)?$", re.I)
+EXEC_NAMES = (".vscode", ".envrc", ".claude", ".codex", ".mcp.json", ".git")
+DENIED = re.compile(r"permission denied|operation not permitted|EACCES|EPERM", re.I)
+PATHS = re.compile(r"(?:^|[\s'\"`:=(])(/[^\s'\"`:;|&<>()]+)")
+
+
+def owner_home():
+    try:
+        with open("/etc/safeai.conf") as f:
+            conf = dict(l.strip().split("=", 1) for l in f if "=" in l)
+        import pwd
+        return pwd.getpwnam(conf["OWNER"]).pw_dir
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def under(p, root):
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+
+def ask(path, want):
+    q = shlex.quote(path)
+    return (f"If you need it, ask the owner for just this path: safeai ask {want} {q} \"why you need it\" "
+            f"(a question on the owner's screen; it waits for the answer). Without an answer, ask in the chat "
+            f"for: safeai {want} {q}. If the owner says no, do without it.")
+
+
+def explain(p, home):
+    """One line on what p is to the agent and what to ask for (paths in full: to the agent, ~
+    is its own home, not the owner's)."""
+    name = os.path.basename(p)
+    if ENV_NAME.match(name) and not ENV_SAMPLE.search(name):
+        return (f"{p} is a secret file (.env-like): safeai keeps it closed to you on purpose. Do not try "
+                f"to read it another way and do not ask to open it; if a value must change, ask the owner "
+                f"to change it themselves.")
+    if name == ".git" and not os.path.exists(p):
+        return (f"You cannot create a git repository in the owner's home ({p}): every repository there "
+                f"is the owner's. Clone or create repositories in your own home (~) instead; to change "
+                f"the owner's projects, edit their files and let the owner commit.")
+    place = next((n for n in p.split("/") if n in EXEC_NAMES or n.endswith(".desktop")), None)
+    if place:
+        what = "a repository's .git" if place == ".git" else place
+        tail = (" In the owner's repositories you cannot commit: leave the changes in the files and tell "
+                "the owner what to commit." if place == ".git" else "")
+        return (f"{p} is inside {what}, which runs code as the owner, so safeai keeps it read-only to you "
+                f"on purpose. Do not work around it.{tail}")
+    # the outermost folder on the way that the agent cannot enter
+    q, blocked = (p if os.path.isdir(p) else os.path.dirname(p)), None
+    while under(q, home) and q != home:
+        if not os.access(q, os.X_OK):
+            blocked = q
+        q = os.path.dirname(q)
+    if blocked and blocked != p:
+        return (f"{p} is closed to you by the owner's safeai rules (the folder {blocked} is closed). "
+                + ask(p, "read"))
+    if blocked:
+        return f"{blocked} is closed to you by the owner's safeai rules. " + ask(blocked, "read")
+    if os.path.exists(p) and not os.access(p, os.R_OK):
+        return f"{p} is closed to you by the owner's safeai rules. " + ask(p, "read")
+    target = p if os.path.exists(p) else os.path.dirname(p)
+    return f"{target} is read-only to you by the owner's safeai rules. " + ask(target, "open")
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        return
+    error = str(event.get("tool_error") or "")
+    if not DENIED.search(error):
+        return
+    home = owner_home()
+    if not home:
+        return
+    tool_input = event.get("tool_input") or {}
+    found = [tool_input.get(k) for k in ("file_path", "path", "notebook_path") if tool_input.get(k)]
+    found += PATHS.findall(error) + PATHS.findall(str(tool_input.get("command") or ""))
+    notes = []
+    for raw in found:
+        p = os.path.normpath(raw)
+        if raw.startswith("/") and under(p, home) and p != home:
+            note = explain(p, home)
+            if note and note not in notes:
+                notes.append(note)
+        if len(notes) == 3:
+            break
+    if notes:
+        json.dump({"hookSpecificOutput": {"hookEventName": "PostToolUseFailure",
+                                          "additionalContext": "safeai: " + " ".join(notes)}}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()
