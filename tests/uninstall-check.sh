@@ -19,6 +19,7 @@ snap() {  # everything safeai may touch, in a comparable form
     systemctl list-unit-files --no-legend 'safeai*' 2>/dev/null
     find "/run/user/$(id -u)" -maxdepth 1 -name 'safeai*' 2>/dev/null
     sudo auditctl -l 2>/dev/null
+    sudo nft list table inet safeai 2>/dev/null; ls /run/safeai-web* 2>/dev/null  # the agent web rule
     [ -d /sys/kernel/security/apparmor ] && sudo grep -c safeai /sys/kernel/security/apparmor/profiles 2>/dev/null
     { dpkg -l 2>/dev/null || rpm -qa 2>/dev/null || pacman -Q 2>/dev/null; } | awk '{print $1, $2}' | sort
 }
@@ -38,12 +39,15 @@ case "${1:-}" in
         echo "Clean: the system is as before"; exit 0 ;;
 esac
 mkdir -p "$H/Projects/demo"
+# a local AppArmor include of the administrator's under the name safeai-keep uses: put back as it was
+[ -d /etc/apparmor.d ] && sudo sh -c 'mkdir -p /etc/apparmor.d/local && echo "# admin rule, kept" >/etc/apparmor.d/local/safeai-keep'
 snap >/tmp/before.txt
 fail=0
 
 # the installer speaks the language asked for, also when it refuses to start
 ru=$(sed -n 's/^MSG\[err_sudo\]="\([^:]*\):.*/\1/p' share/i18n/ru)  # the refusal as the translation has it
 case "$(SAFEAI_LANG=ru ./install.sh --yes 2>&1)" in *"${ru:?}"*) ;; *) echo "FAIL  a refusal of the installer is not translated"; fail=1 ;; esac
+case "$(SAFEAI_LANG=wrong ./install.sh --plan 2>&1)" in *"bad language"*) ;; *) echo "FAIL  an invalid language is silently accepted"; fail=1 ;; esac
 # how it starts (strict or relaxed) has no default: without an answer nothing is installed
 sudo ./install.sh --yes >/dev/null 2>&1 && { echo "FAIL  installed without a chosen start (strict or relaxed)"; fail=1; }
 [ -e /usr/local/bin/safeai ] && { echo "FAIL  something was installed without a chosen start"; fail=1; }
@@ -92,6 +96,16 @@ sudo chattr -i /usr/local/share/bash-completion/completions/safeai
 [ "$(md5sum </usr/local/bin/safeai)" = "$sum" ] || { echo "FAIL  a failed update left the new safeai in place"; fail=1; }
 grep -q "# newer" /usr/local/lib/safeai/agent-shell.sh && { echo "FAIL  a failed update left new files"; fail=1; }
 systemctl is-active --quiet safeai-guard || { echo "FAIL  the guard does not run after a failed update"; fail=1; }
+# an update that brings the rule for the agent's web and then fails takes the rule away again
+if [ -e /etc/apparmor.d/safeai-agent ]; then
+    safeai settings set proxy http://127.0.0.1:18089 >/dev/null
+    sudo sed -i '/^nft-table /d' /var/lib/safeai/manifest  # as installed by a version without it
+    sudo chattr +i /etc/apparmor.d/safeai-agent  # a step after the rule fails
+    sudo /tmp/newer/install.sh --update >/dev/null 2>&1 && { echo "FAIL  the update did not fail"; fail=1; }
+    sudo chattr -i /etc/apparmor.d/safeai-agent
+    sudo nft list table inet safeai >/dev/null 2>&1 && { echo "FAIL  a failed update left the rule for the agent's web"; fail=1; }
+    safeai settings set proxy off >/dev/null 2>&1; rm -f "$H/.config/safeai/proxy"
+fi
 find /tmp/newer -delete
 sudo /usr/local/lib/safeai/uninstall.sh --yes >/dev/null
 # the questions of uninstall, answered in a terminal: keep only the rules, then remove everything
@@ -109,7 +123,7 @@ grep -qx "$H/Projects/demo/kept" "$H/.config/safeai/closed" 2>/dev/null || { ech
     { echo "FAIL  the agent's home was not saved as an archive only you can read"; fail=1; }
 rm -f "$H/agent-home.tar.gz"
 [ -z "$(find "$H/.config/safeai" -mindepth 1 ! -name write-dirs ! -name read-only ! -name closed ! -name env-open \
-    ! -name mode 2>/dev/null)" ] || { echo "FAIL  more than the rules stayed"; fail=1; }
+    ! -name mode ! -name proxy 2>/dev/null)" ] || { echo "FAIL  more than the rules stayed"; fail=1; }
 getent passwd aiagent >/dev/null && { echo "FAIL  the agent user stayed though not kept"; fail=1; }
 sudo /tmp/inst/install.sh --yes >/dev/null || { echo "install failed"; exit 1; }
 sudo -n -u aiagent ls "$H/Projects/demo/kept" >/dev/null 2>&1 && { echo "FAIL  a kept rule did not come back"; fail=1; }
@@ -128,6 +142,8 @@ safeai check --fix >/dev/null 2>&1  # the agent's .vscode runs as you: moved out
 safeai close "$H/Projects/demo/sub" >/dev/null
 safeai read "$H/Projects" >/dev/null
 safeai settings set mode strict >/dev/null
+safeai settings set proxy http://127.0.0.1:18089 >/dev/null  # the kernel rule for the agent's web: removed at the end
+[ "$(cat /run/safeai-web 2>/dev/null)" = on ] || { echo "FAIL  the rule for the agent's web did not come on"; fail=1; }
 out=$(sudo ./install.sh --update 2>&1) || { echo "FAIL  an update of an installed safeai failed"; fail=1; }
 n=$(grep -c '^== Plan$' <<<"$out")
 [ "$n" = 1 ] || { echo "FAIL  an update showed its plan $n times, not once"; fail=1; }

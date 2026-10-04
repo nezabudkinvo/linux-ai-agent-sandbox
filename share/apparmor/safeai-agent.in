@@ -38,4 +38,7 @@ profile safeai-agent flags=(attach_disconnected,mediate_deleted) {
   # aside nor create one (a .git of its own there would point the owner's git at its settings).
   # Writing inside the owner's .git is refused by the ACLs already.
   audit deny @{OWNER_HOME}/**/.git{,/} w,
+  # what the owner closed or made read-only, and the folders around it: not deleted, renamed or
+  # replaced (rules written by safeai-keep from the owner's lists)
+  include if exists <local/safeai-keep>
 }

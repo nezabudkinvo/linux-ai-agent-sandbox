@@ -45,9 +45,12 @@ MSG[plan_core]="  пользователь %s (без пароля, без ва�
   /etc/sudoers.d/safeai          %s может запускать программы от %s; обратного права нет
   /etc/safeai.conf, /usr/local/bin/safeai (с дополнением по Tab), %s/
   службы safeai-guard (root), safeai-check.timer (от %s, каждые 5 минут),
-  safeai-ask.socket (агент может попросить у вас доступ; вопрос появляется на экране)"
+  safeai-ask.socket (агент может попросить у вас доступ; вопрос появляется на экране),
+  safeai-web (root, только правила сети: если вы задали прокси, веб агента идет
+  только через него; таблица nftables inet safeai)"
 MSG[plan_lists]="  ваши списки в %s (хранилища ключей вроде ~/.ssh закрыты в обоих режимах)"
-MSG[plan_apparmor]="  профиль AppArmor /etc/apparmor.d/safeai-agent; оболочка входа %s -> %s/safeai-shell;
+MSG[plan_apparmor]="  профиль AppArmor /etc/apparmor.d/safeai-agent (и его правила из ваших списков в
+  /etc/apparmor.d/local/safeai-keep, служба safeai-keep); оболочка входа %s -> %s/safeai-shell;
   %s добавлен в /etc/cron.deny и /etc/at.deny (с резервной копией)"
 MSG[plan_audit]="  правила аудита /etc/audit/rules.d/50-safeai.rules;
   /etc/audit/auditd.conf: log_group -> %s (с резервной копией)"
@@ -56,13 +59,14 @@ MSG[plan_you]="От вас (без root):
   записи ACL для %s на ваших файлах (только записи этого пользователя; удаляются при удалении)"
 MSG[plan_agent]="От %s: заметки safeai для него (~/.claude/safeai.md, подключается из его CLAUDE.md; часть
   ~/.codex/AGENTS.md - его собственные инструкции остаются), хук Claude Code, который
-  объясняет ему отказы, доверие git к вашим
+  объясняет ему отказы; его Claude при каждом запуске берет прокси из ваших настроек Claude;
+  доверие git к вашим
   репозиториям и ваши имя и почта git для его коммитов"
 MSG[plan_vscode]="  settings.json VS Code: две настройки (прежние значения - в settings.json.safeai-keys)"
 MSG[plan_nautilus]="  ~/.local/share/nautilus-python/extensions/safeai_nautilus.py, его значки в
   ~/.local/share/icons/hicolor/scalable/emblems;
   Файлы перезапускаются, чтобы его загрузить (открытые окна Файлов закроются)"
-MSG[plan_untouched]="Не меняет: настройки сети, других пользователей, ваши группы и вход, другие службы."
+MSG[plan_untouched]="Не меняет: ваши настройки сети (только веб агента, если вы задали прокси), других пользователей, ваши группы и вход, другие службы."
 MSG[plan_undo]="Всё это можно отменить в любой момент: sudo %s/uninstall.sh вернет всё как было."
 MSG[applying]="Настраиваю доступ агента к вашим папкам; если файлов много, это займет минуту-другую."
 MSG[plan_brief]="Пользователь агента %s: без пароля, без sudo, без ваших групп.
@@ -89,10 +93,15 @@ MSG[err_writable]="в %s может писать %s; запустите уста
 MSG[err_sudoers]="проверка правила sudo не прошла"
 MSG[err_auditgroup]="в группе %s есть другие пользователи, они смогут читать журнал аудита; запустите снова и ответьте n на этот вопрос"
 MSG[err_audit]="правила аудита safeai не загрузились (auditctl -l их не показывает); запустите снова и ответьте n про журнал"
+MSG[keep_failed]="Закрытое и только для чтения не защищено от удаления агентом (%s).
+Смотрите: journalctl -u 'safeai-keep@*'; затем: safeai check --fix"
+MSG[web_failed]="Правило для веба агента не применено (%s): пока его нет, агент не запускается.
+Смотрите: journalctl -u safeai-web.service; затем: safeai check --fix"
 MSG[restart_files]="Файлы перезапущены, расширение загружено"
 MSG[done]="Запустите агента в папке проекта: safeai claude (или safeai - его терминал).
 Доступ: safeai open | read | close ПУТЬ. Состояние: safeai status. Настройки: safeai settings.
-Справка: safeai --help. Проверка: %s/check.sh. Удалить: sudo %s/uninstall.sh"
+Справка: safeai --help. Полная самопроверка (временно создает тестовые файлы; около минуты): %s/check.sh.
+Удалить: sudo %s/uninstall.sh"
 
 # uninstall.sh
 MSG[u_full]="Удалить safeai полностью, вместе с вашими правилами%s? [y/n] (Ctrl+C - отмена): "

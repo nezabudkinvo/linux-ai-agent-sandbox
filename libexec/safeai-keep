@@ -1,0 +1,165 @@
+#!/usr/bin/python3 -I
+"""safeai-keep - what the owner closed or made read-only stays where it is (root, AppArmor rules only).
+
+ACLs keep the agent from reading or changing a file, but inside a folder the agent may change, removing
+or renaming an entry is a right on the folder: the agent could delete a file the owner closed there, or
+put its own file in place of a read-only one. This service turns the owner's lists (~/.config/safeai:
+closed, read-only) into AppArmor rules for the agent's profile: none of those paths, and none of the
+folders around them inside the owner's home, can be deleted, renamed or replaced by an agent process.
+Everything else in those folders works as before (new files, renames, saves).
+
+The lists are only read. A request on the socket carries nothing: it applies the lists again. One at a
+time (a lock); the rules go to /etc/apparmor.d/local/safeai-agent (included by the profile) and the
+profile is reloaded; if it does not load, the rules before stay. A path with characters AppArmor would
+read as a pattern, or with line and format characters, is left out and counted; more than PATHS_MAX
+paths is a failure, never a silent cut. State in /run/safeai-keep: "on N [mark of the rules]", "off"
+(no profile), or "failed: why" (also while applying, until the profile has loaded).
+
+    safeai-keep    apply the lists, print the state
+"""
+import contextlib
+import fcntl
+import hashlib
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+PROFILE = "/etc/apparmor.d/safeai-agent"
+RULES = "/etc/apparmor.d/local/safeai-keep"  # a name of its own: no local rules of yours are touched
+STATE = "/run/safeai-keep"
+LOCK = "/run/safeai-keep.lock"
+LIST_MAX = 1 << 20
+PATHS_MAX = 5000
+ODD = re.compile(r'[*?\[\]{}^",\\#@$\x00-\x1f\x7f]')  # pattern, variable, comment and quote characters
+
+
+def system_conf(key, default=None):
+    try:
+        with open("/etc/safeai.conf") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == key and v:
+                    return v
+    except OSError:
+        pass
+    return default
+
+
+def read_list(owner, name):
+    """The owner's list NAME: lines of a regular file of the owner's, not a link; [] when there is none."""
+    try:
+        fd = os.open(f"{owner.pw_dir}/.config/safeai/{name}", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return []
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != owner.pw_uid or st.st_size > LIST_MAX:
+            raise OSError(f"{name}: not a list of the owner's")
+        data = os.read(fd, LIST_MAX)
+    finally:
+        os.close(fd)
+    # one entry a line, as safeai writes them: split at "\n" only (U+2028 and the like are part of a name)
+    return [l for l in data.decode("utf-8", "replace").split("\n") if l.strip() and not l.startswith("#")]
+
+
+def rules(owner):
+    """(the rules text, how many paths were left out)."""
+    home = os.path.normpath(owner.pw_dir)
+    kept, around, odd = [], set(), 0
+    for line in read_list(owner, "closed") + read_list(owner, "read-only"):
+        p = os.path.normpath(line.rstrip("/"))
+        if not p.startswith(home + "/"):
+            continue  # only the owner's home: nothing there names paths of the system
+        if ODD.search(p) or "�" in p or any(unicodedata.category(c) in ("Zl", "Zp", "Cc", "Cf") for c in p):
+            odd += 1
+            continue
+        kept.append(p)
+        a = os.path.dirname(p)
+        while a != home and a.startswith(home + "/"):
+            around.add(a)
+            a = os.path.dirname(a)
+    kept = sorted(set(kept))
+    if len(kept) > PATHS_MAX:
+        raise ValueError(f"{len(kept)} paths, more than {PATHS_MAX}: close whole folders instead of many items")
+    out = ["# safeai-keep: what the owner closed or made read-only, and the folders around it, stay where",
+           "# they are. Written by safeai-keep from the owner's lists; do not edit."]
+    out += [f'  audit deny "{p}" wl,\n  audit deny "{p}/" wl,' for p in kept]
+    out += [f'  audit deny "{a}/" w,' for a in sorted(around - set(kept))]
+    return "\n".join(out) + "\n", odd
+
+
+def write(path, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".safeai-keep.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def apply(owner):
+    if not os.path.exists(PROFILE):
+        return "off"
+    try:
+        text, odd = rules(owner)
+    except (OSError, UnicodeError, ValueError) as e:
+        return f"failed: the lists cannot be taken in ({e})"
+    try:
+        with open(RULES) as f:
+            before = f.read()
+    except OSError:
+        before = None
+    n = text.count("\n  audit deny")
+    mark = hashlib.sha256(text.encode()).hexdigest()[:16]  # which rules the state stands for
+    done = f"on {n}" + (f" ({odd} left out: unusual characters)" if odd else "") + f" [{mark}]"
+    try:
+        with open(STATE) as f:
+            loaded = f.read().strip()
+    except OSError:
+        loaded = ""
+    if text == before and loaded == done:  # these very rules are loaded already
+        return done
+    save_state("failed: applying")  # cut off from here on: no "on" for rules that may not be loaded
+    os.makedirs(os.path.dirname(RULES), exist_ok=True)
+    write(RULES, text)
+    try:
+        r = subprocess.run(["apparmor_parser", "-r", "-K", PROFILE], capture_output=True, text=True)
+        why = (r.stderr.strip().splitlines() or ["apparmor_parser failed"])[-1] if r.returncode else ""
+    except OSError as e:
+        why = f"apparmor_parser: {e.strerror or e}"
+    if why:  # the rules loaded before stay, on disk too
+        if before is None:
+            os.unlink(RULES)
+        else:
+            write(RULES, before)
+        return f"failed: {why}"
+    return done
+
+
+def save_state(state):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".safeai-keep.")
+    with os.fdopen(fd, "w") as f:
+        f.write(state + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE)
+
+
+def main():
+    owner = pwd.getpwnam(system_conf("OWNER") or sys.exit("OWNER missing in /etc/safeai.conf"))
+    with open(LOCK, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = apply(owner)
+        save_state(state)
+    with contextlib.suppress(OSError):  # the one who asked may not wait for the answer
+        print(state, flush=True)
+    return 0  # the state says it all (/run/safeai-keep, safeai status); no failed unit left behind
+
+
+if __name__ == "__main__":
+    sys.exit(main())

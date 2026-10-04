@@ -1,7 +1,5 @@
 # linux-ai-agent-sandbox
 
-[README in Russian](README.ru.md)
-
 **Guard rails, not a jail:** your AI agent keeps working in your real folders,
 and the Linux kernel keeps it out of what you close.
 
@@ -81,36 +79,33 @@ virtual machine.
 
 ## How it looks
 
-```
-$ safeai close ~/Documents/taxes             # the agent never sees this
-$ safeai read ~/bin                          # it may run these, not change them
-$ cd ~/Projects/website && safeai claude     # Claude, working as the agent, here
-$ safeai ls ~/Projects/website
-write   /home/me/Projects/website   (your rule)
-closed  .env   (.env-like name)
-read    .vscode/   (runs code as you)
-$ safeai log                                 # what it tried and was refused
-09-28 21:12     2x  open             cat            ~/Documents/taxes/2025.pdf
-```
+<img src="docs/terminal.png" width="900" alt="A website project: the agent may change the code, only read docs and deploy, never see private files or .env; its web goes only through your proxy">
+
+<img src="docs/files.png" width="420" alt="Files (Nautilus): emblems show what the agent can do with each item; the right-click menu says what it is now and changes it">
+
+<img src="docs/how-it-works.png" width="900" alt="How it works: the agent is a separate Linux user; ACLs, a guard service, AppArmor and a web rule stand between it and your files and network">
 
 ## Install
 
 ```
 git clone https://github.com/nezabudkinvo/linux-ai-agent-sandbox
 cd linux-ai-agent-sandbox
-git checkout v0.2.0     # the latest release; GitHub shows its tag as Verified (signed)
+git checkout v0.3.0     # the latest release; GitHub shows its tag as Verified (signed)
 ./install.sh            # questions, the plan, then sudo for exactly that plan
 ```
 
 The installer runs as you: it asks for a language (English or Russian), the name
 of the agent's user, strict or relaxed (no preset answer) and which options to
 enable, and shows the plan in a few lines (`d` shows every change, file by file).
-Only after your yes does it ask for sudo, to carry out that plan and nothing else. It downloads nothing itself (missing packages come from your
-package manager). The program itself is installed into `/usr/local` (owned by root, so
-nothing running as you or as the agent can change it); the downloaded copy can
-be deleted afterwards.
+Only after your yes does it ask for sudo, to carry out that plan and nothing else.
+It downloads nothing itself (missing packages come from your package manager).
+The program itself is installed into `/usr/local` (owned by root, so nothing
+running as you or as the agent can change it); the downloaded copy can be deleted
+afterwards.
 
-Check the result: `/usr/local/lib/safeai/check.sh` (as yourself).
+Run the full self-test: `/usr/local/lib/safeai/check.sh` (as yourself). It takes
+about a minute and temporarily creates test folders and settings in your home;
+it removes them before reporting `All checks passed`.
 
 Interrupted? Ctrl+C during the install undoes what it had done. After anything
 harder (a crash, a power cut), run `./install.sh` again to finish, or
@@ -136,7 +131,7 @@ safeai claude [ARGS]            Claude as the agent, in this folder (offers to o
                                 safeai codex, or any program, the same way
 safeai                          a terminal as the agent, in this folder
 safeai status                   protection, mode, every rule you set, who runs the chats
-safeai settings                 settings in a menu: mode, VS Code, Files; there, "reset" drops
+safeai settings                 settings in a menu: mode, VS Code, Files, proxy; "reset" drops
                                 all your rules, "update" installs a newer signed release (both ask)
 safeai ls [PATH]                what the agent can do with each entry here
 safeai why PATH                 which rule decides that for one path, and how to change it
@@ -201,6 +196,8 @@ itself, editing what runs as you. Keep those few apart:
   Codex settings: you would run them as yourself;
 - a chat you continue stays with whoever started it, whatever the switch says. The
   agent's chats appear in the VS Code chat list too;
+- with a proxy set, the agent's Claude and Codex work only through it (see
+  Network below);
 - for the strongest separation, do not run your own chats and the agent's in the
   same folder. Keep a folder the agent cannot write for your own work (fixing the
   system, changing safeai, your rules for agents); a chat as you there cannot pick
@@ -254,12 +251,36 @@ In both modes:
   `safeai close`;
 - files the agent creates in open folders become yours.
 
-The agent's network is not restricted: it uses the system's routing like any
-other program (the agents' own sandboxes, such as Claude Code's `/sandbox`,
-do not run inside safeai: they need to mount file systems, which safeai's
-AppArmor profile refuses). It shares `localhost` with you: a dev server it starts opens in
-your browser as usual, and services you run locally are reachable to it like to
-any user of the machine, so keep those behind a password.
+### Network
+
+Apart from a proxy you use (below), the agent's network is not restricted: it uses
+the system's routing like any other program (the agents' own sandboxes, such as
+Claude Code's `/sandbox`, do not run inside safeai: they need to mount file
+systems, which safeai's AppArmor profile refuses). It shares `localhost` with you:
+a dev server it starts opens in your browser as usual, and services you run
+locally are reachable to it like to any user of the machine, so keep those behind
+a password.
+
+**A proxy.** If you send Claude through a proxy (`HTTPS_PROXY` in the `env` of
+your `~/.claude/settings.json`), the agent works through it too. Or give one in
+`safeai settings` (proxy, address) or with `safeai settings set proxy IP:PORT`:
+one on this machine (`127.0.0.1:8080`) or in your network (`10.1.2.3:3128`), by
+its IP address. `auto` takes the one from your Claude settings again, `off` turns
+this off. Then:
+
+- the agent's Claude and Codex get that proxy at every start (Claude above its
+  own and the project's settings; in the agent's terminal, as it was when the
+  terminal opened), and do not start while it does not answer;
+- nothing of the agent starts while the kernel rule below is not in place;
+- the kernel lets the agent reach the web (ports 80 and 443) only through the
+  proxy (on this machine, or at its address), whatever program it runs: nothing goes around it by mistake (a program
+  that ignores proxy settings, a proxy app that is down). It is not a wall against
+  an agent set on getting out another way (see SECURITY.md, Known limits);
+- ssh, git over ssh and every other port work as usual;
+- only the proxy and certificate variables pass from your Claude settings; your
+  sign-in, hooks and history stay yours.
+
+`safeai status` shows the proxy in use.
 
 ### Rules inside folders
 
@@ -268,6 +289,10 @@ any user of the machine, so keep those behind a password.
   you had set differently there (the command lists what that changed).
 - What you do to a file or a folder inside applies to it alone. Close one file in
   an open folder, and the folder stays open with that file closed.
+- What you close or make read-only inside an open folder also cannot be deleted,
+  renamed or replaced by the agent, nor the folders around it renamed; the rest of
+  the folder works as usual. This needs AppArmor (see SECURITY.md); without it,
+  keep such files in a read-only folder.
 - Open something inside a closed folder, and that folder becomes **partly open**:
   the agent reaches only what you opened there; it cannot list the folder or add
   anything to it. Close what you opened, and the folder is closed again.
@@ -318,10 +343,12 @@ questions, Files and VS Code works from the terminal.
 
 Optional:
 
-- AppArmor, to refuse `.env` files to the agent at open time. It is on by
+- AppArmor, to refuse `.env` files to the agent at open time and to keep what you
+  closed or made read-only from being deleted or replaced by it. It is on by
   default in Ubuntu, Debian and openSUSE; on Arch enable it first (see the Arch
   wiki, "AppArmor") and run the installer again. Without it the guard service
   closes new `.env` files right after they appear.
+- nftables, for the proxy rule (installed when missing).
 - auditd, for `safeai log`.
 - nautilus-python, for the Files extension.
 
@@ -330,8 +357,12 @@ Optional:
 - It records every file, user, service and package it creates in
   `/var/lib/safeai/manifest` and backs up every existing file it changes.
 - If a step fails, it reverts everything it did.
-- It changes no network settings (firewall, routing, DNS), no other users, your
-  groups or your login. The only downloads are missing packages, from your
+- The agent user has no password and does not appear on the login screen
+  (AccountsService, used by GDM and LightDM, is told it is a system account).
+- It changes no network settings of yours (routing, DNS, your firewall rules), no
+  other users, your groups or your login. Its own nftables table `inet safeai`
+  holds a rule only while you have a proxy set (see Network), and only for
+  the agent user's web traffic. The only downloads are missing packages, from your
   package manager.
 - `uninstall.sh` reverts the manifest: restores the backed-up files, removes what
   was created, removes the ACL entries it put on your files and gives your files
@@ -358,6 +389,12 @@ in the plan (`./install.sh --plan` prints all of it).
 - `libexec/safeai-run` - starts a program as the agent with a clean environment
   (no tokens, no session sockets), inside the AppArmor profile. For VS Code it
   first decides who runs the chat (the agent, or you as the status bar switch says).
+  Agent Claude and Codex also get your proxy (see Network).
+- `libexec/safeai-keep` - a root service with AppArmor rules only: what you
+  closed or made read-only (and the folders around it) cannot be deleted,
+  renamed or replaced by the agent.
+- `libexec/safeai-web` - a root service with network rules only: with a local
+  proxy set, the agent's web goes only through it (nftables table `inet safeai`).
 - `safeai-ask.socket` - the agent's questions (`safeai ask`), answered on your
   screen by a service that runs as you.
 - `share/vscode` - the VS Code extension: the status bar switch and the Explorer
@@ -365,7 +402,8 @@ in the plan (`./install.sh --plan` prints all of it).
 - `libexec/safeai-shell` - the agent's login shell: everything it starts runs
   inside the profile.
 - `share/apparmor/safeai-agent.in` - the profile: everything is allowed except
-  secret-looking file names outside `/tmp`, mounts and profile changes.
+  secret-looking file names outside `/tmp`, mounts, profile changes and, from
+  safeai-keep, removing or replacing what your lists protect.
 - A systemd timer runs `safeai check --fix` every 5 minutes.
 
 ### Testing
@@ -373,7 +411,8 @@ in the plan (`./install.sh --plan` prints all of it).
 `tests/vm.sh test ubuntu [strict|relaxed]` (also `debian`, `arch`) boots a
 throwaway virtual machine (QEMU/KVM, no root needed), installs this checkout and
 runs the checks there. `tests/vm.sh clean ubuntu` installs, uses and removes
-safeai, then compares the machine with how it was before.
+safeai, then compares the machine with how it was before; `tests/vm.sh upgrade
+ubuntu` installs the last release and updates it with this checkout.
 
 ## Acknowledgements
 

@@ -32,17 +32,30 @@ safeai open "$work" >/dev/null
 # what this check tries as the agent is refused on purpose: safeai log leaves this run out. Its time is
 # recorded at the end (also when it stops early), so the log checks below still see it.
 t0=$(date +%s) ST=$H/.config/safeai/self-tests
-ran() { { tail -n 49 "$ST" 2>/dev/null; echo "$t0 $(date +%s)"; } >"$ST.new" && mv "$ST.new" "$ST"; trap - EXIT; }
+ran() {  # also on a stop half way: the rule for the agent's web back as your own settings say
+    { tail -n 49 "$ST" 2>/dev/null; echo "$t0 $(date +%s)"; } >"$ST.new" && mv "$ST.new" "$ST"; trap - EXIT
+    safeai _web >/dev/null 2>&1
+}
 trap ran EXIT
 
 echo "Agent user:"
 id -nG "$AGENT" | tr ' ' '\n' | grep -qvx "$AGENT" && bad "$AGENT is in other groups" || ok "$AGENT has only its own group"
 $AG sudo -n true 2>/dev/null && bad "$AGENT has sudo" || ok "$AGENT has no sudo"
+# the login screen (GDM, LightDM) lists the people AccountsService does not call system accounts
+if u=$(busctl call org.freedesktop.Accounts /org/freedesktop/Accounts org.freedesktop.Accounts FindUserByName s \
+        "$AGENT" 2>/dev/null | sed -n 's/^o "\(.*\)"$/\1/p') && [ -n "$u" ]; then
+    [ "$(busctl get-property org.freedesktop.Accounts "$u" org.freedesktop.Accounts.User SystemAccount 2>/dev/null)" = "b true" ] \
+        && ok "the login screen does not list $AGENT" || bad "the login screen lists $AGENT as a person"
+else
+    skip "no AccountsService: the login screen"
+fi
 
 echo "Closed:"
 [ -d "$H/.ssh" ] && deny "~/.ssh" "ls $H/.ssh"
 while read -r p; do
-    [ -n "$p" ] && [ -e "$p" ] && deny "${p#$H/}" "cat '$p' 2>/dev/null || ls '$p'"
+    if [ -n "$p" ] && [ -e "$p" ]; then
+        if [ -d "$p" ]; then deny "${p#$H/}" "ls '$p'"; else deny "${p#$H/}" "cat '$p'"; fi
+    fi
 done < <(grep -v '^#' "$H/.config/safeai/closed" 2>/dev/null)
 
 t=$work/.safeai-check-$$
@@ -188,8 +201,8 @@ case "$(c=$H/safeai-check-typo-$$; mkdir "$c"; safeai close "$c" >/dev/null; cd 
     *"neither a safeai command"*) ok "a mistyped command stops before anything is opened" ;;
     *) bad "a mistyped command is not stopped" ;;
 esac
-case "$(cd "$work" && safeai claude </dev/null 2>&1)" in
-    *"not installed for the agent"*|*"$AGENT"*) ok "safeai claude: runs it, or says how to install it" ;;
+case "$(cd "$work" && safeai claude --version </dev/null 2>&1)" in
+    *"not installed for the agent"*|*"(Claude Code)"*|*"is not started"*) ok "safeai claude: runs it, or says how to install it" ;;
     *) bad "safeai claude: neither runs it nor says how to install it" ;;
 esac
 if [ -n "${SAFEAI_TEST_VM:-}" ]; then  # a throwaway machine: stop the guard for a moment
@@ -273,6 +286,170 @@ if command -v git >/dev/null; then
 else skip "git missing: a chat as you in the agent's own repository"; fi
 switch agent "$ro" "$pj"
 case "$(switch "$ro")|$(chat "$ro")" in "agent|$AGENT "*) ok "...and back to the agent" ;; *) bad "the switch back to the agent" ;; esac
+network=$work/claude-network
+printf '#!/bin/sh\nprintf "%%s|%%s|%%s|%%s|%%s|%%s|%%s\\n" "${HTTPS_PROXY-}" "${HTTP_PROXY-}" "${https_proxy-}" "${NO_PROXY-}" "${FOO_TOKEN-}" "${SSL_CERT_FILE-}" "$*"\n' \
+    >"$network" && chmod 755 "$network"
+codexnetwork=$work/codex-network; cp "$network" "$codexnetwork"
+# a stand-in for the proxy program on port 18089 (a local proxy app)
+listen() { exec python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 18089)); s.listen(); time.sleep(int(sys.argv[1]))' "$1"; }
+# can USER reach HOST:PORT: refused (the web rule answers at once), or anything else (the network's own answer)
+PROBE='import socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2).close(); print("open")
+except ConnectionRefusedError:
+    print("refused")
+except OSError:
+    print("other")'
+listen 180 & proxy=$!
+sleep 1
+printf '{"env":{"HTTPS_PROXY":"http://127.0.0.1:18089","FOO_TOKEN":"SAFEAI-MARK","SSL_CERT_FILE":"/tmp/claude-ca.pem"}}\n' \
+    >"$fh/.claude/settings.json"
+out=$(cd "$ro" && env HTTPS_PROXY=http://wrong:1 HTTP_PROXY=http://wrong:2 https_proxy=http://wrong:3 \
+    NO_PROXY='*' FOO_TOKEN=SAFEAI-MARK SSL_CERT_FILE=/tmp/wrong.pem SAFEAI_HOME="$fh" DISPLAY= WAYLAND_DISPLAY= \
+    $LIB/safeai-run "$network" --version </dev/null 2>/dev/null)
+case "$out" in "http://127.0.0.1:18089||http://127.0.0.1:18089|||/tmp/claude-ca.pem|"*"--settings"*"HTTPS_PROXY"*"127.0.0.1:18089"*)
+        ok "agent Claude inherits the owner's network settings, but not secrets" ;;
+    *) bad "agent Claude did not safely inherit the owner's network settings: $out" ;;
+esac
+out=$(cd "$ro" && env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u NO_PROXY -u FOO_TOKEN -u SSL_CERT_FILE \
+    SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$codexnetwork" app-server </dev/null 2>/dev/null)
+case "$out" in "http://127.0.0.1:18089||http://127.0.0.1:18089|||/tmp/claude-ca.pem|app-server")
+        ok "agent Codex gets the same proxy, through its environment" ;;
+    *) bad "agent Codex lacks the owner's proxy: $out" ;;
+esac
+[ "$(cat /run/safeai-web 2>/dev/null)" = on ] && ok "with a local proxy set, the kernel rule for the agent's web is on" \
+    || bad "the agent's web rule is not on: $(cat /run/safeai-web 2>&1)"
+# 192.0.2.1 (a documentation address) never answers: only the rule refuses at once
+case "$($AG python3 -c "$PROBE" 192.0.2.1 443)|$($AG python3 -c "$PROBE" 127.0.0.1 18089)" in
+    refused\|open) ok "the agent reaches the web (443) only through the proxy" ;;
+    *) bad "the agent's web around the proxy: $($AG python3 -c "$PROBE" 192.0.2.1 443)" ;; esac
+case "$($AG python3 -c "$PROBE" 192.0.2.1 22)|$(python3 -c "$PROBE" 192.0.2.1 443)" in  # a VPN may answer itself
+    open\|open|open\|other|other\|open|other\|other) ok "...while ssh (22) of the agent and the owner's own web are not touched" ;;
+    *) bad "the web rule reaches beyond the agent's web: $($AG python3 -c "$PROBE" 192.0.2.1 22)|$(python3 -c "$PROBE" 192.0.2.1 443)" ;; esac
+case "$(SAFEAI_HOME="$fh" safeai status 2>&1)" in
+    *"Agent web: only through your proxy http://127.0.0.1:18089 (from your Claude settings)"*)
+        ok "status shows the proxy the agent's web goes through" ;; *) bad "status does not show the agent's proxy" ;; esac
+[ "$(cd "$work" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run id -un 2>/dev/null)" = "$AGENT" ] &&
+    ok "...and other programs VS Code runs get no proxy settings of Claude's" || bad "the editor launcher gave another program Claude's --settings"
+printf '{"env":{"HTTPS_PROXY":"http://u:SAFEAI-MARK@proxy:3128"}}\n' >"$fh/.claude/settings.json"
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+case "$out" in *"Claude settings contains a login"*) ok "a proxy login stops agent Claude instead of leaking it or going direct" ;;
+    *) bad "agent Claude did not stop on a proxy login: $out" ;;
+esac
+printf '{"env":{"HTTPS_PROXY":10809}}\n' >"$fh/.claude/settings.json"
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+case "$out" in *"HTTPS_PROXY"*"must be a string"*) ok "a mistyped proxy stops agent Claude instead of going direct" ;;
+    *) bad "agent Claude did not stop on a mistyped proxy: $out" ;;
+esac
+printf '{"env":{"HTTPS_PROXY":"http://127.0.0.1:18089"}}\n' >"$fh/.claude/settings.json"
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --settings '{}' </dev/null 2>&1 || true)
+case "$out" in *"cannot be combined with the network settings"*) ok "explicit Claude settings cannot override the inherited proxy" ;;
+    *) bad "explicit Claude settings bypassed the inherited proxy: $out" ;;
+esac
+printf '{\n' >"$fh/.claude/settings.json"
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+case "$out" in *"cannot be read as JSON"*) ok "broken owner Claude settings stop agent Claude instead of losing its proxy" ;;
+    *) bad "agent Claude did not stop on broken owner settings: $out" ;;
+esac
+SAFEAI_HOME="$fh" safeai _web >/dev/null 2>&1
+case "$(cat /run/safeai-web)|$($AG python3 -c "$PROBE" 192.0.2.1 443)" in "on|refused")
+        ok "...and do not take the rule for the agent's web away" ;;
+    *) bad "broken owner Claude settings turned the rule for the agent's web off: $(cat /run/safeai-web)" ;; esac
+WEBF=$H/.config/safeai/web
+wc=$(cat "$WEBF")
+echo maybe >"$WEBF"
+ask_web() { python3 -c 'import socket
+s = socket.socket(socket.AF_UNIX); s.connect("/run/safeai-web.sock"); s.shutdown(socket.SHUT_WR)
+print(s.makefile().readline().strip())'; }
+case "$(ask_web)|$($AG python3 -c "$PROBE" 192.0.2.1 443)" in "failed: the choice is neither on nor off|refused")
+        ok "a choice safeai-web cannot read leaves the rule as it is" ;;
+    *) bad "a broken choice changed the rule for the agent's web: $(cat /run/safeai-web)" ;; esac
+echo "$wc" >"$WEBF" && ask_web >/dev/null
+printf '{"env":{"HTTPS_PROXY":"http://127.0.0.1:18089","FOO_TOKEN":"SAFEAI-MARK"}}\n' >"$fh/.claude/settings.json"
+out=$(cd "$work" && echo 'echo "${HTTPS_PROXY-}|${https_proxy-}|${FOO_TOKEN-}|${SAFEAI_CLAUDE_SETTINGS:+settings}|${SAFEAI_CLAUDE_PROXIES-}"' |
+    env -u HTTPS_PROXY -u FOO_TOKEN https_proxy=http://wrong:3 SAFEAI_HOME="$fh" safeai 2>/dev/null | tail -1)
+[ "$out" = "http://127.0.0.1:18089|http://127.0.0.1:18089||settings|127.0.0.1:18089" ] &&
+    ok "claude and codex typed in the agent's shell get the same network settings" \
+    || bad "the agent's shell lacks the owner's network settings: $out"
+kill "$proxy" 2>/dev/null; wait "$proxy" 2>/dev/null
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+case "$out" in *"proxy 127.0.0.1:18089 does not answer"*) ok "with the proxy program down agent Claude does not start" ;;
+    *) bad "agent Claude started with its proxy down: $out" ;; esac
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$codexnetwork" app-server </dev/null 2>&1 || true)
+case "$out" in *"proxy 127.0.0.1:18089 does not answer"*) ok "...nor agent Codex" ;;
+    *) bad "agent Codex started with its proxy down: $out" ;; esac
+$AG python3 -c 'import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 18089)); s.listen(); time.sleep(10)' & taken=$!
+sleep 1
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+case "$out" in *"held by $AGENT"*) ok "...nor when the agent holds the free proxy port" ;;
+    *) bad "agent Claude started through a proxy port the agent holds: $out" ;; esac
+out=$($AG env SAFEAI_CLAUDE_SETTINGS='{}' SAFEAI_CLAUDE_PROXIES=127.0.0.1:18089 bash -c ". $LIB/agent-shell.sh; cd /tmp; codex --version" 2>&1)
+case "$out" in *"held by $AGENT"*) ok "...also typed in the agent's own terminal" ;;
+    *) bad "codex in the agent's terminal started through a port the agent holds: $out" ;; esac
+kill "$taken" 2>/dev/null; wait "$taken" 2>/dev/null
+listen 20 & proxy=$!  # yours on 127.0.0.1, the agent's on ::1, the same port
+$AG python3 -c 'import socket, time
+s = socket.socket(socket.AF_INET6); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("::1", 18089)); s.listen(); time.sleep(10)' 2>/dev/null & taken=$!
+sleep 1
+if grep -q ':46A9 00000000000000000000000000000000:0000 0A' /proc/net/tcp6 2>/dev/null; then
+    out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+    case "$out" in *"held by $AGENT"*) ok "...nor when the agent holds that port on another loopback address" ;;
+        *) bad "agent Claude started while the agent holds the proxy port on ::1: $out" ;; esac
+else skip "no IPv6 loopback: the proxy port held on ::1"; fi
+kill "$taken" "$proxy" 2>/dev/null; wait "$taken" "$proxy" 2>/dev/null
+# a proxy set in safeai settings wins over Claude's; only one on this machine, without a login
+listen 60 & proxy=$!
+sleep 1
+printf '{"env":{"HTTPS_PROXY":"http://127.0.0.1:9"}}\n' >"$fh/.claude/settings.json"
+SAFEAI_HOME="$fh" safeai settings set proxy http://127.0.0.1:18089 >/dev/null
+out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$codexnetwork" app-server </dev/null 2>&1 || true)
+case "$out" in "http://127.0.0.1:18089|http://127.0.0.1:18089|http://127.0.0.1:18089|"*) ok "a proxy set in safeai settings wins over Claude's" ;;
+    *) bad "the proxy set in safeai settings was not used: $out" ;; esac
+case "$(SAFEAI_HOME="$fh" safeai settings set proxy proxy.example:3128 2>&1)|$(SAFEAI_HOME="$fh" safeai settings set proxy http://u:p@127.0.0.1:1 2>&1)" in
+    *"IP address"*"without a login"*) ok "...given by its IP address, without a login" ;;
+    *) bad "safeai settings took a proxy by name or with a login" ;; esac
+# a proxy in your network (192.0.2.1, a documentation address: it never answers)
+SAFEAI_HOME="$fh" safeai settings set proxy 192.0.2.1:443 >/dev/null
+case "$(cat /run/safeai-web)|$($AG python3 -c "$PROBE" 192.0.2.1 443)|$($AG python3 -c "$PROBE" 192.0.2.2 443)" in
+    "on 192.0.2.1:443|o"*"|refused") ok "a proxy in your network: the agent reaches it, and nothing else on the web" ;;
+    *) bad "a proxy elsewhere: $(cat /run/safeai-web)|$($AG python3 -c "$PROBE" 192.0.2.1 443)|$($AG python3 -c "$PROBE" 192.0.2.2 443)" ;; esac
+# one that refuses: this machine's own address, port 9 (a virtual machine's network may answer for 192.0.2.1)
+myip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -m1 '\.')
+if [ -n "$myip" ] && SAFEAI_HOME="$fh" safeai settings set proxy "$myip:9" >/dev/null 2>&1; then
+    out=$(cd "$ro" && SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY $LIB/safeai-run "$codexnetwork" app-server </dev/null 2>&1 || true)
+    case "$out" in *"proxy $myip:9 does not answer"*) ok "...and Codex does not start while it does not answer" ;;
+        *) bad "agent Codex with a proxy elsewhere that does not answer: $out" ;; esac
+else skip "no address of this machine: a proxy elsewhere that does not answer"; fi
+for i in 1 2 3 4 5 6 7 8; do  # requests at once, the choice changing under them; the last choice wins
+    echo "$([ $((i % 2)) = 0 ] && echo on || echo off)" >"$WEBF.n$i" && mv "$WEBF.n$i" "$WEBF"; ask_web >/dev/null &
+done
+wait "${!}"; sleep 2
+echo on >"$WEBF"; ask_web >/dev/null
+case "$(cat /run/safeai-web)|$($AG python3 -c "$PROBE" 192.0.2.1 443)" in "on|refused")
+        ok "requests to safeai-web at once end in the last choice, applied" ;;
+    *) bad "requests at once left the rule out of step: $(cat /run/safeai-web)" ;; esac
+kill "$proxy" 2>/dev/null; wait "$proxy" 2>/dev/null
+SAFEAI_HOME="$fh" safeai settings set proxy off >/dev/null
+rm -f "$WEBF" && mkdir "$WEBF"  # a choice that cannot be written: the rule cannot come on
+SAFEAI_HOME="$fh" safeai settings set proxy http://127.0.0.1:18089 >/dev/null 2>&1
+case "$(cd "$work" && echo true | SAFEAI_HOME="$fh" safeai 2>&1)|$(cd "$work" && SAFEAI_HOME="$fh" safeai true 2>&1)" in
+    *"agent's web is down"*"|"*"agent's web is down"*) ok "nothing of the agent starts while the rule for its web is not in place" ;;
+    *) bad "the agent started without the rule for its web" ;; esac
+rmdir "$WEBF"
+SAFEAI_HOME="$fh" safeai settings set proxy off >/dev/null
+out=$(cd "$ro" && env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy SAFEAI_HOME="$fh" env -u DISPLAY -u WAYLAND_DISPLAY \
+    $LIB/safeai-run "$network" --version </dev/null 2>&1 || true)
+case "$out|$(cat /run/safeai-web 2>/dev/null)|$($AG python3 -c "$PROBE" 192.0.2.1 443)" in "|||||"*"--version|off|"o*)
+        ok "safeai settings set proxy off: no proxy given, no rule for the agent's web" ;;
+    *) bad "proxy off still passed the network settings or kept the rule: $out" ;; esac
+rm -f "$fh/.claude/settings.json" "$network" "$codexnetwork"
+rm -f "$fh/.config/safeai/proxy"
+safeai _web >/dev/null  # the rule for the agent's web back as your own settings say
 rm -f "$fakecodex" "$where"
 switch me "$ro" && SAFEAI_HOME="$fh" safeai settings set vscode off >/dev/null 2>&1
 [ ! -e "/run/user/$(id -u)/safeai-me" ] && ok "switching VS Code off drops the switch" || bad "the switch outlives VS Code off"
@@ -310,7 +487,7 @@ case "$(cd "$work" && $LIB/safeai-run --agent sh -c 'echo "$HOME|$PATH"' </dev/n
     </dev/null 2>/dev/null)" = "$H" ] && ok "the agent's terminal: install hints, home goes to your home folder" \
     || bad "the agent's terminal does not load safeai's part (~/.bashrc)"
 case "$(cd "$H" && safeai claude </dev/null 2>&1)" in
-    *"project folder"*|*"folder inside your home"*) ok "an AI tool does not start in your home folder itself (it would take your settings)" ;;
+    *"project folder"*|*"folder inside your home"*|*"is not started"*) ok "an AI tool does not start in your home folder itself (it would take your settings)" ;;
     *) bad "an AI tool starts in your home folder itself" ;; esac
 if [ -n "${SAFEAI_TEST_VM:-}" ]; then  # root's file in an open folder (a sudo make install leaves such)
     rf=$work/root-owned-$$; sudo -n sh -c "echo x >'$rf'"
@@ -547,8 +724,16 @@ loader = importlib.machinery.SourceFileLoader("safeai", sys.argv[1])
 m = importlib.util.module_from_spec(importlib.util.spec_from_loader("safeai", loader))
 loader.exec_module(m)
 v = m.vtuple
-sys.exit(not (v("v0.2.0") < v("0.2.1-dev") < v("v0.2.1") < v("0.3.0-dev") and v("x") is None))
+sys.exit(not (v("v0.2.0") < v("0.2.1-dev") < v("v0.2.1") < v("0.3.0-dev") and v("x") is None
+              and m.audit_noise("clear_console", "/dev/console")
+              and m.audit_noise("clear_console", "/dev/tty0")
+              and not m.audit_noise("cat", "/dev/console")))
 EOF
+cwd=$t/close-from-here; mkdir "$cwd"; out=$(cd "$cwd" && safeai open . >/dev/null && safeai close .)
+case "$out" in *"agent process is working inside"*) bad "closing the current folder mistakes its own probe for an agent process" ;;
+    *) ok "closing the current folder does not invent an agent process" ;;
+esac
+rmdir "$cwd"
 safeai read "$t/.env" </dev/null >/dev/null 2>&1 && bad "a secret opened without asking" \
     || ok "reading a secret needs your yes in a terminal"
 p=$t/bypass; mkdir "$p" && safeai close "$p" >/dev/null && setfacl -m "u:$AGENT:rwx" "$p" && safeai check --fix >/dev/null 2>&1
@@ -568,6 +753,40 @@ for u in safeai-guard.service safeai-check.timer; do
 done
 safeai check >/dev/null && ok "safeai check: all good" || bad "safeai check found problems"
 
+# inside a folder the agent can change, what you closed or made read-only stays where it is (AppArmor)
+if [ -e /etc/apparmor.d/safeai-agent ]; then
+    k=$work/kept-$$
+    mkdir -p "$k/d" && echo s >"$k/a.txt" && echo r >"$k/b.txt" && echo w >"$k/c.txt" && echo x >"$k/d/in.txt"
+    # no waiting here: the command itself returns only once the rules are loaded
+    safeai open "$k" >/dev/null && safeai close "$k/a.txt" "$k/d" >/dev/null && safeai read "$k/b.txt" >/dev/null
+    # no terminal for them: mv would ask before replacing a file it may not write, and wait for an answer
+    agent_sh() { (cd "$1" && $LIB/safeai-run --agent sh -c "$2" </dev/null >/dev/null 2>&1) && echo allowed || echo refused; }
+    out="$(agent_sh "$k" 'rm -f a.txt')|$(agent_sh "$k" 'mv b.txt b2')|$(agent_sh "$k" 'sed -i s/r/R/ b.txt')"
+    out="$out|$(agent_sh "$k" 'mv -f c.txt b.txt')|$(agent_sh "$k" 'mv d d2')|$(agent_sh "$work" "mv kept-$$ moved-$$")"
+    [ "$out" = "refused|refused|refused|refused|refused|refused" ] &&
+        ok "what you closed or made read-only in an open folder: not deleted, renamed or replaced, nor the folder around it" ||
+        bad "the agent deleted, renamed or replaced what you protected (rm|mv|sed -i|mv onto|mv folder|mv around): $out"
+    out="$(agent_sh "$k" 'touch new')|$(agent_sh "$k" 'mv new new2')|$(agent_sh "$k" 'rm new2')|$(agent_sh "$k" 'sed -i s/w/W/ c.txt')"
+    [ "$out" = "allowed|allowed|allowed|allowed" ] && ok "...while the rest of that folder works as usual" ||
+        bad "protecting a file stopped the agent's work around it (touch|mv|rm|sed -i): $out"
+    case "$(cat /run/safeai-keep 2>/dev/null)" in on*) ok "safeai-keep has the rules loaded" ;;
+        *) bad "safeai-keep: $(cat /run/safeai-keep 2>&1)" ;; esac
+    odd=$k/$'line\u2028break'; echo x >"$odd"  # a name AppArmor rules cannot hold safely: counted, not cut
+    safeai close "$odd" >/dev/null
+    case "$(cat /run/safeai-keep)|$(safeai status 2>&1)" in *"left out"*"kept from deletion"*"left out"*)
+            ok "...and a name it cannot cover is counted, not cut to another name" ;;
+        *) bad "a name with a line separator was not counted: $(cat /run/safeai-keep)" ;; esac
+    if [ -n "${SAFEAI_TEST_VM:-}" ]; then  # safeai-keep down: the command says so and fails
+        sudo -n systemctl stop safeai-keep.socket
+        out=$(safeai read "$k/c.txt" 2>&1); rc=$?
+        sudo -n systemctl start safeai-keep.socket
+        case "$rc|$out" in 1\|*"not kept from deletion"*) ok "...and a rule change it cannot take in fails, saying so" ;;
+            *) bad "a rule change succeeded without safeai-keep: $rc $out" ;; esac
+    fi
+    safeai open "$k" >/dev/null 2>&1 && safeai _keep >/dev/null  # its rules go again
+    find "$k" -mindepth 1 -delete 2>/dev/null; rmdir "$k"
+else skip "no AppArmor: what you protect in open folders can be deleted by the agent"; fi
+
 find "$t/repo" -mindepth 1 -delete 2>/dev/null; rmdir "$t/repo" 2>/dev/null
 find "$t/new" -mindepth 1 -delete 2>/dev/null; rmdir "$t/new" 2>/dev/null
 find "$t/proj" -mindepth 1 -delete 2>/dev/null; rmdir "$t/proj" 2>/dev/null
@@ -586,10 +805,16 @@ done
 find "$Q" -mindepth 1 -type d -empty -delete 2>/dev/null
 [ -z "$(find "$Q" -path "*/safeai-check-work-$$*" -print -quit 2>/dev/null)" ] && ok "nothing of this check is left in the quarantine" \
     || bad "this check left files in the quarantine"
+[ -d "$H/.ssh" ] && $AG ls "$H/.ssh" >/dev/null 2>&1  # refused just before the end: among the newest in the log
 ran
 if [ -r /var/log/audit/audit.log ]; then
     safeai log 1 | grep -q "safeai-check-work-$$" && bad "safeai log shows what this check tried as the agent" \
         || ok "safeai log leaves out what this check tried as the agent"
+    # refused elsewhere while it ran (its ~/.ssh probe here): maybe not the check's, so shown, marked
+    if grep -q "name=\"$H/.ssh\"" /var/log/audit/audit.log 2>/dev/null; then
+        grep -qE '[^ ]\* +~/\.ssh' <<<"$(safeai log 1)" && ok "...but shows, marked, what was refused elsewhere while it ran" \
+            || bad "safeai log hides or does not mark what was refused outside this check's folders"
+    else skip "no refusal of ~/.ssh in the audit log: the mark for the check's time"; fi
 fi
 [ $fail = 0 ] && echo "All checks passed" || echo "Some checks failed"
 exit $fail

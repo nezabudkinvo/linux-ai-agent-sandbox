@@ -23,7 +23,7 @@ you automatically, not the project code you choose to run.
 | Separate user | your session (D-Bus, Wayland, ssh-agent), your processes, sudo | uid; the only sudo rule is you -> agent |
 | ACLs | closed / read-only / open paths; executable places read-only | POSIX ACL entries for the agent user, default ACLs in open folders |
 | Guard service | new `.env` closed and a new repo's whole `.git` (and `.vscode`, ...) made read-only at creation; agent files handed to you | root fanotify service |
-| AppArmor (optional) | `.env`-like names refused at open time, no mount | profile on every agent process: login shell, editor launcher, its `systemd --user`; cron/at denied |
+| AppArmor (optional) | `.env`-like names refused at open time, no mount; what you closed or made read-only (and the folders around it) not deleted, renamed or replaced | profile on every agent process: login shell, editor launcher, its `systemd --user`; cron/at denied |
 | Audit (optional) | a record of refused actions | kernel audit rules for the agent's uid |
 | Launchers | the agent starts only as the agent, only while the guard (and the profile, if installed) are up | `safeai`, `safeai-run`; VS Code settings point at `safeai-run` |
 | Questions (`safeai ask`) | the agent asks you on screen; you decide | a root-owned socket only the agent's group can reach, answered by a service running as you |
@@ -64,6 +64,20 @@ moment before ACLs catch up.
   chat runs as you only when you said so (the status bar switch) or when it
   continues a chat you started as yourself, and never next to Claude Code or Codex
   settings the agent made.
+- With a proxy set (by default the one in the env of the owner's
+  `~/.claude/settings.json`), agent Claude and Codex get only the proxy and
+  certificate variables, at every start (Claude as `--settings`, above the
+  agent's own and the project's settings). A proxy that does not answer, whose
+  port the agent holds, or with a login in its URL stops the start. The kernel
+  (safeai-web, nftables) refuses the agent user TCP 80/443 and UDP 443 anywhere
+  but loopback and the address of a proxy on another machine, so no agent program
+  reaches the web around the proxy; other ports (ssh) are not limited. A proxy
+  is given by IP address (a name could point anywhere). safeai-web runs as root
+  with only CAP_NET_ADMIN (and CAP_DAC_READ_SEARCH to read the owner's choice:
+  "off", or "on" with the proxies elsewhere as IP:PORT); a request on its socket
+  only applies that choice again. Nothing of the owner's Claude
+  profile is copied into the agent's home. `safeai settings set proxy off`
+  turns all this off.
 
 ## Modes
 
@@ -222,12 +236,29 @@ your decision, not a check: allowing gives the agent exactly what `safeai read` 
 - The network is shared: services you run on `localhost` (dev servers, databases,
   notebooks, local AI tools, admin panels) are reachable to the agent like to any
   local user. Protect them with authentication or stop them while the agent works.
+- The proxy rule (safeai-web) keeps the agent's web traffic from going around your
+  proxy by mistake: programs that ignore proxy variables, a proxy app that is
+  down. It limits ports 80 and 443 only, so an agent set on it can still reach the
+  internet another way: through a proxy or a tunnel on another port (ssh included),
+  or through a local service of yours that forwards traffic. DNS lookups go through
+  the system's resolver, by the system's routes.
 - Secrets under other names are not caught by name: close them explicitly.
 - Copies of closed files elsewhere are not closed: backups, `cp -r`, and git
   history (`safeai close` warns when a closed path is in the history).
 - A process already inside a folder keeps access after you close it until it
   exits.
-- Rules name paths. Inside a folder the agent can change, it can rename an item
+- Without AppArmor, ACLs alone keep a closed or read-only item inside a folder the
+  agent can change from being read or changed, not from being removed: deleting or
+  renaming an entry is a right on the folder. The agent could delete a file you
+  closed there, or put its own file in place of a read-only one (`sed -i` and most
+  editors save that way; the check every 5 minutes makes the new file read-only
+  again but does not bring the old content back). With AppArmor, safeai-keep
+  turns your closed and read-only lists into profile rules that refuse this, and
+  the renaming of the folders around them; a path with characters AppArmor reads
+  as a pattern (`* ? [ ] { } ^ , " \ # @ $`) is left out, and `safeai status`
+  counts it. Files private to you that you did not list are not covered. Without
+  AppArmor, keep such files in a read-only or closed folder.
+- Rules name paths. Without AppArmor, inside a folder the agent can change, it can rename an item
   you closed there: the item keeps its closed entry, but the rule no longer names
   it, and opening the folder again later (or an update re-applying the rules)
   opens it. Close whole folders the agent does not work in, rather than single
@@ -249,6 +280,6 @@ The depth of the protection was checked before release over several review round
 by Claude Opus 5.5 and by Astra 6, an independent Codex-based reviewer, besides the
 author. Their findings were fixed, each with a regression test in `tests/check.sh`,
 and the fixes were checked on Ubuntu, Debian and Arch virtual machines, including
-uninstall and power cuts during install. This raises confidence but is not a
+uninstall, power cuts during install and an update over the previous release. This raises confidence but is not a
 professional security audit: before relying on safeai to keep an agent away from
 important data, have it audited, and read "Known limits" above.

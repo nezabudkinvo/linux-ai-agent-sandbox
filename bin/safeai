@@ -23,6 +23,10 @@ folder or file, what it may do; the kernel enforces it with ACLs.
                                         as you by the switch in the status bar (its extension)
                                       emblems on|off - closed / read-only emblems in Files
                                       notifications on|off - Files tells you about problems
+                                      proxy auto|off|IP:PORT - the agent's web (Claude, Codex,
+                                        curl, ...) only through a proxy; auto: the one in the
+                                        env of your ~/.claude/settings.json; ssh and the rest
+                                        as usual
     safeai ls [PATH]                what the agent can do with each entry (asks the kernel)
     safeai why PATH                 which rule decides that for one path, and how to change it
     safeai open PATH...             the agent may read and write
@@ -45,11 +49,13 @@ in ~/.config/safeai.
 The agent itself has one command: safeai ask read|open PATH [WHY] shows you its question
 on your screen (Allow / No) and tells it the answer.
 """
+import atexit
 import contextlib
 import datetime
 import fcntl
 import functools
 import glob
+import ipaddress
 import json
 import os
 import pwd
@@ -64,6 +70,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import urllib.parse
 
 
 def system_conf(key, default):
@@ -192,6 +199,51 @@ def save(name, items):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, f"{CONF}/{name}")
+    if name in ("closed", "read-only"):  # the AppArmor rules first: the ACLs change after this returns
+        state = keep_apply()
+        if state.startswith("failed") and not save.failed:
+            save.failed = True
+            atexit.register(keep_failed, state)
+
+
+def keep_failed(state):
+    """At the end of a command that changed your lists: safeai-keep could not take them in."""
+    sys.stdout.flush()
+    print(f"safeai: what you closed or made read-only is not kept from deletion by the agent ({state[8:]}); "
+          "safeai check --fix tries again", file=sys.stderr)
+    sys.stderr.flush()
+    os._exit(1)
+
+
+save.failed = False
+KEEP_STATE = "/run/safeai-keep"  # what safeai-keep (root) applied: "on N", "off" or "failed: why"
+KEEP_SOCK = "/run/safeai-keep.sock"
+KEEP_UNIT = "/etc/systemd/system/safeai-keep.socket"
+PROFILE = "/etc/apparmor.d/safeai-agent"
+
+
+def keep_state():
+    try:
+        with open(KEEP_STATE) as f:
+            return f.read().strip()
+    except OSError:
+        return "off"
+
+
+def keep_apply():
+    """Your closed and read-only lists as AppArmor rules (safeai-keep): the agent cannot delete, rename or
+    replace those paths, or the folders around them. Inside a folder the agent can change, the ACLs alone
+    do not stop that: removing an entry is a right on the folder. "off" without the AppArmor profile."""
+    if not os.path.exists(PROFILE) or not os.path.exists(KEEP_UNIT) or os.environ.get("SAFEAI_INSTALLING"):
+        return "off"  # no AppArmor, or not set up yet (the installer asks for it itself, at its end)
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(120)
+            s.connect(KEEP_SOCK)
+            s.shutdown(socket.SHUT_WR)
+            return s.makefile().readline().strip() or keep_state()
+    except OSError as e:
+        return f"failed: safeai-keep does not answer ({e.strerror or e})"
 
 
 def full(p):
@@ -602,7 +654,10 @@ def git_copies(path):
 
 
 def agent_cwds(root):
-    r = subprocess.run(as_agent("sh", "-c", 'for p in /proc/[0-9]*; do readlink "$p/cwd"; done 2>/dev/null'),
+    # The probe itself inherits safeai's cwd.  Do not mistake that short-lived shell for an agent
+    # already working in the folder the owner is closing.
+    r = subprocess.run(as_agent("sh", "-c",
+                       'for p in /proc/[0-9]*; do [ "$p" = "/proc/$$" ] || readlink "$p/cwd"; done 2>/dev/null'),
                        capture_output=True, text=True, stdin=subprocess.DEVNULL)
     return sum(1 for c in r.stdout.splitlines() if under(c, root))
 
@@ -660,9 +715,10 @@ def menu(title, rows, cur=0, hint="up/down, Enter, q"):
         out = f"\033[{drawn}A\r" if drawn else ""
         out += "\033[J"
         if not clear_only:
-            lines = [paint(title, 1)] + [
+            # every line cut to the width: a wrapped line would throw the redraw off by one
+            lines = [paint(title[:width], 1)] + [
                 f"{paint(POINTER, 36)} {paint(r[:width], 1)}" if i == cur else f"  {r[:width]}" for i, r in enumerate(rows)
-            ] + [paint(hint, 2)]
+            ] + [paint(hint[:width], 2)]
             out += "\r\n".join(lines) + "\r\n"
             drawn = len(lines)
         sys.stdout.write(out)
@@ -1382,7 +1438,7 @@ def reason(p, s, a, inside_closed=False):
     if p == HOME and s["mode"] == "strict":
         return "pass", "strict mode: your home can be entered, not listed", \
             "strict mode: the agent can pass through your home but not list it", ""
-    if mode_of(p, s) == "closed":
+    if mode_of(p, s) == "closed" and not kind and s["mode"] == "strict":
         return a, "strict mode", "strict mode: everything in your home is closed until you open it", \
             f"safeai read {q}  /  safeai open {q}"
     top = f"{HOME}/{os.path.relpath(p, HOME).split('/')[0]}" if under(p, HOME) and p != HOME else None
@@ -1391,6 +1447,9 @@ def reason(p, s, a, inside_closed=False):
                                   "except what you open"), f"safeai read {q}  /  safeai open {q}"
     if kind:
         verb = {"closed": "you closed", "read-only": "you made read-only", "open": "you opened"}[kind]
+        if at in by_mode[kind]:  # the mode's own default, not a rule you set
+            verb = {"closed": f"{s['mode']} mode closes", "read-only": f"{s['mode']} mode makes read-only",
+                    "open": f"{s['mode']} mode opens"}[kind]
         atrel = "~/" + os.path.relpath(at, HOME)
         if a == "no" and kind != "closed":
             return a, "private by its own permissions", (f"inside {atrel}, which {verb}, but private by its own "
@@ -1478,6 +1537,11 @@ def self_tests():
     return out
 
 
+def audit_noise(comm, target):
+    """Expected shell cleanup denied by confinement, not an agent action useful to the owner."""
+    return comm == "clear_console" and target in ("/dev/console", "/dev/tty0")
+
+
 def refusals(hours):
     """{(kind, target, comm): [count, last time]} of the agent's refused actions; refusals.skipped:
     how many came from safeai's own check and are left out."""
@@ -1529,16 +1593,21 @@ def refusals(hours):
     for e in events.values():
         if "kind" not in e:
             continue
-        if any(a <= e["ts"] <= b for a, b in tests):
-            refusals.skipped += 1
-            continue
         target = e.get("target")
         if target is None:
             names = [n for t, n in e["paths"] if n and t != "PARENT"] or [n for t, n in e["paths"] if n]
             target = names[0] if names else "?"
             if not target.startswith("/") and e.get("cwd"):
                 target = os.path.normpath(os.path.join(e["cwd"], target))
-        g = groups.setdefault((e["kind"], target, e.get("comm") or ""), [0, 0])
+        comm = e.get("comm") or ""
+        if audit_noise(comm, target):
+            continue
+        if any(a <= e["ts"] <= b for a, b in tests):
+            if re.search(r"/safeai-check-[a-z]+-\d+(/|$)", target):  # in the check's own folders: its probes
+                refusals.skipped += 1
+                continue
+            comm += "*"  # while it ran, elsewhere: maybe its probe, maybe not - shown, marked
+        g = groups.setdefault((e["kind"], target, comm), [0, 0])
         g[0] += 1
         g[1] = max(g[1], e["ts"])
     return groups
@@ -1565,6 +1634,8 @@ def cmd_log(arg):
         target, comm = clean(target), clean(comm)
         print(f"{time.strftime('%m-%d %H:%M', time.localtime(ts))}  {n:>4}x  {kind:<16} {comm:<14} {target}")
     print(f"Total: {sum(g[0] for g in groups.values())}, distinct: {len(groups)}{own}")
+    if any(c.endswith("*") for _k, _t, c in groups):
+        print("* while safeai's own check ran: maybe one of its probes")
     if review_items(groups) and sys.stdout.isatty():
         print("Decide on the places it needed: safeai log review" + ("" if arg is None else f" {arg}"))
 
@@ -1641,6 +1712,10 @@ def protection():
                                 stderr=subprocess.DEVNULL).returncode == 0
         out.append(("the AppArmor profile", loaded,
                     "not loaded. Load it: sudo apparmor_parser -r /etc/apparmor.d/safeai-agent", True))
+    web, want = web_state(), web_wanted()
+    if (want and want != "off") or web.startswith("failed"):
+        out.append(("the rule for the agent's web", web == want or (want is None and web.startswith("on")),
+                    f"its web would not go only through your proxy ({web}). Apply it: safeai check --fix", True))
     if system_conf("AUDIT", "n") == "y":
         out.append(("the audit log", active("auditd.service"), "safeai log shows nothing new. Start it: sudo "
                     "systemctl start auditd", False))
@@ -1660,6 +1735,31 @@ def cmd_status():
                                                                if os.path.isdir(f)))  # a window of a folder now gone: none
     else:
         print("  VS Code chats: yours, not through safeai (safeai settings: vscode)")
+    net, why = agent_network()
+    env = (net or {}).get("env", {})
+    proxies = [v for n, v in sorted(env.items(), key=lambda nv: nv[0].lower() != "https_proxy")
+               if n.lower() in PROXY_NAMES and v]
+    mode, web = proxy_setting(), web_state()
+    why = why or (proxies and (proxy_problem(env) or (web != web_choice(env) and f"the agent's web is not limited to "
+                                                                       f"your proxy ({web}); safeai check --fix applies it")))
+    src = " (from your Claude settings)" if mode == "auto" else ""
+    if why:
+        print(f"  {paint(BAD_MARK, 31)} agent Claude and Codex do not start: {why}")
+    elif proxies:
+        print(f"  Agent web: only through your proxy {proxies[0]}{src}; ssh and the rest as usual")
+    else:
+        print("  Agent web: as the system routes it (" + ("safeai settings: proxy off)" if mode == "off" else
+                                                       "no proxy in your Claude settings; safeai settings: proxy)"))
+    keep = keep_state()
+    if not os.path.exists(PROFILE):
+        print(paint("  Without AppArmor, what you closed or made read-only inside the agent's open folders can "
+                    "be deleted or replaced by it", 2))
+    elif keep.startswith("failed"):
+        print(f"  {paint(BAD_MARK, 31)} what you closed or made read-only is not kept from deletion: {keep[8:]}; "
+              "safeai check --fix")
+    elif "left out" in keep:
+        shown = re.sub(r" \[\w+\]$", "", keep[3:])  # without the mark of the rules
+        print(paint(f"  kept from deletion: {shown}", 2))
     # your rules as a tree, each with what it means now; the nearest rule decides for a path
     rules = sorted(((p, k) for k, key in (("closed", "closed"), ("read-only", "read"), ("open", "work"))
                     for p in s[key] if os.path.lexists(p)), key=lambda r: r[0].split("/"))
@@ -1998,6 +2098,7 @@ SETTINGS = {  # name: (values, what it is)
     "vscode": (("on", "off"), "VS Code chats through safeai: the agent, you by the status bar switch"),
     "emblems": (("on", "off"), "closed / read-only emblems in Files"),
     "notifications": (("on", "off"), "Files tells you about problems"),
+    "proxy": (("auto", "off"), "the agent's web only through a proxy: auto, off, or an address you give"),
 }
 
 
@@ -2006,6 +2107,8 @@ def setting(name):
         return state()["mode"]
     if name == "vscode":
         return "on" if vscode_on() else "off"
+    if name == "proxy":
+        return proxy_setting()
     return "off" if lines(name) == ["off"] else "on"
 
 
@@ -2021,7 +2124,12 @@ def unavailable():
 
 
 def cmd_setting_set(name, value):
-    if name not in SETTINGS or value not in SETTINGS[name][0]:
+    if name == "proxy" and value not in SETTINGS[name][0]:
+        value = proxy_url(value)
+        why = proxy_url_problem(value)
+        if why:
+            sys.exit(f"proxy: {why} (or auto, off)")
+    elif name not in SETTINGS or value not in SETTINGS[name][0]:
         sys.exit("safeai settings set: " + "; ".join(f"{k} {'|'.join(v)}" for k, (v, _w) in SETTINGS.items()))
     if name in unavailable():
         sys.exit(f"{name}: {unavailable()[name]}")
@@ -2035,9 +2143,30 @@ def cmd_setting_set(name, value):
             sys.exit(1)
     elif name == "emblems":
         cmd_emblems(value)
+    elif name == "proxy":  # the kernel rule follows at once, for agent programs already running too
+        save(name, [value])
+        state = web_apply()
+        print(f"proxy: {value}; the agent's web " + ("only through it" if state.startswith("on") else
+                                                      "as the system routes it" if state == "off" else
+                                                      f"cannot be limited to it: {state}"))
     else:  # the Files extension reads it at every action
         save(name, [value])
         print(f"{name}: {value}")
+
+
+CHOICES = {  # (setting, value): what it means, in the menu of that setting
+    ("mode", "strict"): "the agent sees nothing in your home until you open it",
+    ("mode", "relaxed"): "your folders open to the agent; settings and programs read-only",
+    ("vscode", "on"): "Claude Code and Codex chats run as the agent (the status bar switches it per window)",
+    ("vscode", "off"): "VS Code as before: every chat is yours",
+    ("emblems", "on"): "show what the agent can do with each item in Files",
+    ("emblems", "off"): "no emblems",
+    ("notifications", "on"): "Files tells you about problems",
+    ("notifications", "off"): "it does not",
+    ("proxy", "auto"): "the proxy in the env of your ~/.claude/settings.json, if there is one",
+    ("proxy", "off"): "no proxy given, the agent's web as the system routes it",
+    ("proxy", "address"): "a proxy you give: the agent's web only through it",
+}
 
 
 def cmd_settings():
@@ -2049,6 +2178,8 @@ def cmd_settings():
         for name in names:
             values, what = SETTINGS[name]
             val = "-" if name in missing else setting(name)
+            if name == "proxy" and val not in values:  # a URL you set
+                val, what = "set", f"the agent's web only through {val}"
             rows.append(f"{name:14} {val:8} {missing.get(name, what)}")
         rows += [f"{'reset':14} {'':8} drop the rules you set ({setting('mode')} and its defaults stay; asks first)",
                  f"{'update':14} {'':8} a newer signed release (shows what changes, asks first)"]
@@ -2056,7 +2187,7 @@ def cmd_settings():
             for r in rows:
                 print(f"  {r}")
             return print("Change: safeai settings (in a terminal) or safeai settings set NAME VALUE")
-        i = menu("safeai settings", rows, cur, "up/down: choose, Enter: change, q: quit")
+        i = menu("safeai settings", rows, cur, "up/down: choose, Enter: its choices, q: quit")
         if i is None:
             return
         cur = i
@@ -2071,8 +2202,26 @@ def cmd_settings():
         if name in missing:
             print(f"{name}: {missing[name]}")
             continue
-        a, b = SETTINGS[name][0]
-        new = b if setting(name) == a else a  # every setting has two values: the other one
+        now = setting(name)
+        options = list(SETTINGS[name][0]) + (["address"] if name == "proxy" else [])
+        shown = "address" if name == "proxy" and now not in SETTINGS[name][0] else now
+        rows = [f"{v:10} {CHOICES.get((name, v), '')}" + ("   (now)" if v == shown else "") for v in options]
+        if name == "proxy" and shown == "address":
+            rows[-1] += f": {now}"
+        j = menu(f"{name}: {SETTINGS[name][1]}", rows, options.index(shown), "up/down: choose, Enter: set, q: back")
+        if j is None:
+            continue
+        new = options[j]
+        if new == "address":  # a proxy you give: typed here, checked as by safeai settings set proxy
+            try:
+                new = input(f"Proxy address, IP:PORT ({now if shown == 'address' else 'for example 127.0.0.1:8080'}; "
+                            "Enter: back): ").strip()
+            except EOFError:
+                new = ""
+            if not new:
+                continue
+        if new == now:
+            continue
         if name == "mode":  # the only one that changes access to your whole home: ask
             what = ("the agent sees nothing in your home until you open it; what you opened stays open"
                     if new == "strict" else "your visible folders open to the agent, programs read-only")
@@ -2104,10 +2253,267 @@ def own_copy(d):
     return False
 
 
+NETWORK_ENV = (
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+)
+PROXY_NAMES = ("http_proxy", "https_proxy", "all_proxy")
+PROXY_URL = re.compile(r"^(https?|socks5h?|socks4a?)://[^@/\s]+:\d{1,5}/?$")
+SHELL_NET = ("SAFEAI_CLAUDE_SETTINGS", "SAFEAI_CLAUDE_PROXIES", "SAFEAI_CLAUDE_STOP")  # for the agent's shell
+WEB_STATE = "/run/safeai-web"  # what safeai-web (root) applied: on, off or "failed: why"
+WEB_SOCK = "/run/safeai-web.sock"
+WEB_FILE = f"{_o.pw_dir}/.config/safeai/web"  # what safeai-web reads: in your real home, one rule for the machine
+
+
+def proxy_setting():
+    """auto (the proxy in your ~/.claude/settings.json), off, or the proxy URL you set."""
+    v = (lines("proxy") or ["auto"])[0]
+    return "auto" if v == "on" else v  # "on": a 0.2.1-dev setting
+
+
+def proxy_url(value):
+    """What you typed as the proxy, as a URL: IP:PORT means http://IP:PORT."""
+    return value if "://" in value else f"http://{value}"
+
+
+def proxy_url_problem(url):
+    """Why URL cannot be your proxy for the agent's web, or None."""
+    if "@" in url:
+        return "a proxy with a login stays yours: use one without a login"
+    if not PROXY_URL.match(url):
+        return "a proxy is IP:PORT, or http://IP:PORT (socks5:// too)"
+    eps = proxy_endpoints({"https_proxy": url})
+    if not eps or not (is_local(eps[0][0]) or is_ip(eps[0][0])):
+        return "give the proxy's IP address (127.0.0.1, 10.1.2.3, [::1]), not a name: the kernel rule needs one"
+    return None
+
+
+def agent_network():
+    """(network settings for agent Claude and Codex or None, why they must not start or None).
+
+    The proxy is yours: by default the one in the env of your ~/.claude/settings.json (read at every start,
+    so a changed proxy counts from the next chat), or the one you set (safeai settings: proxy). Certificates
+    come from the same env. Only these variables pass: your Claude home itself (credentials, trust, hooks)
+    stays yours. Claude gets them as --settings, above the agent's own and the project's settings, which the
+    agent can change; Codex and the rest through the environment. With a proxy on this machine safeai-web
+    lets the agent reach the web (ports 80 and 443) only through it, whatever a program does."""
+    mode = proxy_setting()
+    if mode == "off":
+        return None, None
+    try:
+        with open(f"{HOME}/.claude/settings.json") as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        settings = {}
+    except (OSError, ValueError):
+        return None, "your ~/.claude/settings.json cannot be read as JSON"
+    values = settings.get("env", {}) if isinstance(settings, dict) else None
+    if not isinstance(values, dict):
+        return None, "env in your ~/.claude/settings.json is not a JSON object"
+    for name in NETWORK_ENV:
+        if name in values and not isinstance(values[name], str):
+            return None, f"{name} in your ~/.claude/settings.json must be a string"
+    if mode != "auto":  # yours, set in safeai settings: above whatever Claude's settings say
+        values = {**{n: v for n, v in values.items() if n.lower() not in (*PROXY_NAMES, "no_proxy")},
+                  "https_proxy": mode, "http_proxy": mode}
+    proxies = {n: v for n, v in values.items() if n.lower() in PROXY_NAMES and n in NETWORK_ENV}
+    if any("@" in v for v in proxies.values()):
+        return None, "the proxy in your Claude settings contains a login, which stays yours: use one without a login"
+    inherited = {n: values[n] for n in NETWORK_ENV if n in values}
+    if proxies:
+        # Both spellings, the same value: one left from the desktop session or the agent's settings must not
+        # win, and an empty one is no help either - git and Python read lowercase first and take "" for
+        # "no proxy" (Claude and curl go on to uppercase). Lowercase wins where you set both, as in Claude.
+        for kind in (*PROXY_NAMES, "no_proxy"):
+            inherited[kind] = inherited[kind.upper()] = values.get(kind, values.get(kind.upper(), ""))
+    return ({"env": inherited} if inherited else None), None
+
+
+def proxy_endpoints(env):
+    """[(host, port)] of the proxies in env, the host as written (an address, or a name)."""
+    out = []
+    for name, value in env.items():
+        if name.lower() not in PROXY_NAMES or not value:
+            continue
+        try:
+            u = urllib.parse.urlsplit(proxy_url(value))
+            host, port = u.hostname, u.port or (443 if u.scheme == "https" else 1080 if u.scheme.startswith("socks")
+                                                 else 80)
+        except ValueError:
+            continue
+        if host:
+            out.append((host, port))
+    return list(dict.fromkeys(out))
+
+
+def is_local(host):
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def local_proxies(env):
+    """["host:port"] of the proxies on this machine in env."""
+    return [f"{h}:{p}" for h, p in proxy_endpoints(env) if is_local(h)]
+
+
+def checkable_proxies(env):
+    """["host:port"] of the proxies that can be tried before a launch: on this machine, or an IP address."""
+    return [f"{h}:{p}" for h, p in proxy_endpoints(env) if is_local(h) or is_ip(h)]
+
+
+def web_choice(env):
+    """What safeai-web is to apply for these proxies: "off" without one; "on", followed by the proxies
+    elsewhere (IP:PORT, [IPv6]:PORT) that the agent may reach on ports 80 and 443 too."""
+    eps = proxy_endpoints(env)
+    if not eps:
+        return "off"
+    away = []
+    for h, p in eps:
+        if not is_local(h) and is_ip(h):
+            a = ipaddress.ip_address(h)
+            away.append(f"[{a}]:{p}" if a.version == 6 else f"{a}:{p}")
+    return " ".join(["on", *dict.fromkeys(away)])
+
+
+def web_ok(state):
+    return state == "off" or state.startswith("on")
+
+
+def port_holders(port):
+    """uids listening on this TCP port of the machine, on any address and in both families: which one a
+    connection reaches depends on the address, so any of them counts."""
+    out = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                rows = [r.split() for r in f.read().splitlines()[1:]]
+        except OSError:
+            continue
+        out.update(int(r[7]) for r in rows if len(r) > 7 and r[3] == "0A" and int(r[1].rsplit(":", 1)[1], 16) == port)
+    return out
+
+
+def proxy_problem(env):
+    """Why agent Claude and Codex must not start now, or None: a proxy of this machine from your settings
+    is down (they would only wait for it), or the agent itself holds its port (while the proxy program is
+    down, any user can take a free port and send everything around the proxy)."""
+    for host, port in proxy_endpoints(env):
+        hp = f"{host}:{port}"
+        if not (is_local(host) or is_ip(host)):
+            if port in (80, 443):  # the kernel rule lets the agent reach 80 and 443 only at addresses it knows
+                return f"your proxy {hp} is a name on a web port: give its IP address (safeai settings set proxy IP:PORT)"
+            continue
+        if is_local(host) and AGENT_UID in port_holders(port):
+            return f"your proxy port {hp} is held by {AGENT}, not by your proxy app"
+        try:
+            socket.create_connection((host, port), timeout=2).close()
+        except OSError:
+            return f"your proxy {hp} does not answer (is your proxy app running?)"
+    return None
+
+
+def web_state():
+    try:
+        with open(WEB_STATE) as f:
+            return f.read().strip()
+    except OSError:
+        return "off"  # not applied since boot: no rule
+
+
+def web_wanted():
+    """on: the agent's web only through your proxy (one on this machine is set); off: no proxy of this
+    machine; None: your settings cannot be read, so the rule stays as it is (never off by an error)."""
+    net, why = agent_network()
+    if why:
+        return None
+    return web_choice(net["env"]) if net else "off"
+
+
+def web_apply(want=None):
+    """Make the kernel rule for the agent's web match your setting; the state it is in now. "on" is
+    always confirmed by safeai-web itself, which reads your choice after it is written: a state recorded
+    by an earlier request of another safeai is not trusted for it."""
+    want = want or web_wanted()
+    if want is None:
+        return web_state()
+    try:
+        with open(WEB_FILE) as f:
+            saved = f.read().strip()
+    except OSError:
+        saved = None
+    if (saved or "off") != want:  # whole, and under a name of its own: two safeai at once do not collide
+        tmp = None
+        try:
+            os.makedirs(os.path.dirname(WEB_FILE), mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(WEB_FILE), prefix=".web.")
+            with os.fdopen(fd, "w") as f:
+                f.write(want + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, WEB_FILE)
+        except OSError as e:
+            if tmp:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+            return f"failed: your choice cannot be written ({e.strerror or e})"
+    if want == "off" and web_state() == "off":
+        return "off"
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(20)
+            s.connect(WEB_SOCK)
+            s.shutdown(socket.SHUT_WR)
+            reply = s.makefile().readline().strip()
+    except OSError as e:
+        return f"failed: safeai-web does not answer ({e.strerror or e})"
+    return reply or web_state()
+
+
+def network_launch(argv, claude):
+    """(argv for agent Claude or Codex, why it must not start or None), with your network settings."""
+    net, why = agent_network()
+    if why:
+        return argv, why
+    if not net:
+        web_apply("off")
+        return argv, None
+    if claude and any(a.split("=", 1)[0] == "--settings" for a in argv):
+        return argv, "--settings cannot be combined with the network settings safeai gives agent Claude"
+    why = proxy_problem(net["env"])
+    want = web_choice(net["env"])
+    if not why and want != "off" and web_state() != want:
+        why = f"the agent's web cannot be limited to your proxy: {web_state()}"
+    os.environ.update(net["env"])  # also for what they run: curl, git, npm
+    return ([*argv, "--settings", json.dumps(net)] if claude else argv), why
+
+
+def shell_network():
+    """Your network settings for claude and codex typed in the agent's shell: agent-shell.sh passes them on
+    and checks the proxy at every start; the shell itself starts in any case."""
+    for k in SHELL_NET:
+        os.environ.pop(k, None)
+    net, why = agent_network()
+    if why:
+        os.environ["SAFEAI_CLAUDE_STOP"] = why
+    if net:
+        os.environ.update(net["env"])
+        os.environ["SAFEAI_CLAUDE_SETTINGS"] = json.dumps(net)
+        os.environ["SAFEAI_CLAUDE_PROXIES"] = " ".join(checkable_proxies(net["env"]))
+
+
 def cmd_start(argv=()):
     """PROGRAM ARGS (or a shell) as the agent in the current folder, inside its AppArmor profile.
     A folder closed to the agent is offered to be opened first: yes by default, since you start
     the agent here, except for a folder directly in ~, which holds a whole area of your files."""
+    web_apply()  # your proxy setting, before anything of the agent runs
     why = protection_down()
     if why:
         sys.exit(f"safeai: the agent is not started: {why}")
@@ -2118,6 +2524,12 @@ def cmd_start(argv=()):
         # before any question: a mistyped command must not open this folder to the agent
         sys.exit(127 if argv[0] in ("claude", "codex", "gemini") else
                  f"safeai: {argv[0]} is neither a safeai command nor a program the agent has (safeai --help)")
+    for k in SHELL_NET:  # set again below for the shell only
+        os.environ.pop(k, None)
+    if argv and os.path.basename(argv[0]) in ("claude", "codex"):
+        argv, why = network_launch(argv, os.path.basename(argv[0]) == "claude")
+        if why:
+            sys.exit(f"safeai: agent {os.path.basename(argv[0]).capitalize()} is not started: {why}")
     cwd = os.path.realpath(".")
     access = (agent_access([cwd]) or ["no"])[0]
     if access == "no":
@@ -2142,6 +2554,9 @@ def cmd_start(argv=()):
         os.execv(run, [run, "--agent", "bash", "-lc", f'. {LIB}/agent-shell.sh; "$@"', "safeai", *argv])
     if sys.stdin.isatty():
         print(f"safeai: a shell as {AGENT} in {cwd} (exit to leave; home: back to your home folder)")
+    shell_network()
+    if os.environ.get("SAFEAI_CLAUDE_STOP") and sys.stdin.isatty():
+        print(f"safeai: claude and codex do not start here now: {os.environ['SAFEAI_CLAUDE_STOP']}")
     os.execv(run, [run, "--agent", "bash", "-l"])
 
 
@@ -2527,6 +2942,14 @@ def cmd_editor(argv):
             argv = [*argv, "--settings", json.dumps(OWNER_HOOKS)]  # marks the chat; your settings stay as they are
         os.chdir(cwd)
         os.execv(argv[0], argv)
+    for k in SHELL_NET:
+        os.environ.pop(k, None)
+    web_apply()  # your proxy setting, before anything of the agent runs
+    name = os.path.basename(argv[0])
+    if "claude" in name or "codex" in name:  # what else VS Code runs gets no proxy settings, and no --settings
+        argv, why = network_launch(argv, tool == "Claude Code")
+        if why:
+            refuse(f"agent {tool} is not started: {why}", chat)
     why = protection_down()
     if why:
         refuse(f"the agent is not started: {why}", chat)
@@ -2841,7 +3264,7 @@ def cmd_answer():
 
 
 COMMANDS = ("status", "settings", "ls", "why", "open", "read", "close", "check", "log", "setup", "init",
-            "_auto", "_vscode", "_vscode-off", "_chats", "_answer", "_who", "_window", "_launches", "ask")
+            "_auto", "_vscode", "_vscode-off", "_chats", "_answer", "_who", "_window", "_launches", "_web", "_keep", "ask")
 
 
 def main(a):
@@ -2891,13 +3314,24 @@ def main(a):
         return cmd_who(a[1:])
     if c == "_window":
         return cmd_window(a[1:])
+    if a == ["_keep"]:  # your lists as AppArmor rules (the installer, check.sh)
+        return print(keep_apply())
+    if a == ["_web"]:  # the kernel rule for the agent's web as your settings say (check.sh puts it back)
+        return print(web_apply())
     if a == ["_launches"]:  # the last decisions of the VS Code launcher, for debugging
         return print(open(LAUNCHES).read() if os.path.exists(LAUNCHES) else "none yet", end="")
     if c == "check" and a[1:] in ([], ["--fix"]):
         problems = cmd_check("--fix" in a)
         if "--fix" in a and vscode_on():  # the timer: the agent's new chats in the VS Code list too
             sync_chats()
-        return sys.exit(1 if problems and "--fix" not in a else 0)
+        web = web_apply() if "--fix" in a else web_state()  # a proxy changed in your Claude settings: the rule follows
+        if not web_ok(web):
+            print(f"The rule for the agent's web is not in place: {web}")
+        keep = keep_apply() if "--fix" in a else keep_state()  # your lists as AppArmor rules, again
+        if keep.startswith("failed"):
+            print(f"What you closed or made read-only is not kept from deletion: {keep[8:]}")
+        return sys.exit(1 if (problems and "--fix" not in a) or not web_ok(web) or keep.startswith("failed")
+                        else 0)
     if c == "log" and len(a) <= 2 and (len(a) == 1 or a[1] == "all" or a[1].isdigit()):
         return cmd_log(a[1] if len(a) > 1 else None)
     if a[:2] == ["log", "review"] and len(a) <= 3 and (len(a) == 2 or a[2] == "all" or a[2].isdigit()):

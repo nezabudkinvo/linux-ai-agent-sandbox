@@ -128,8 +128,13 @@ fi
 # once started, it runs to the end: Ctrl+C would only kill a tool half way through (userdel, the package
 # manager); run it again to finish if it was stopped some other way
 trap '' INT
-systemctl disable --now safeai-guard.service safeai-check.timer safeai-ask.socket >/dev/null 2>&1
-systemctl stop 'safeai-ask@*.service' >/dev/null 2>&1
+systemctl disable --now safeai-guard.service safeai-check.timer safeai-ask.socket safeai-web.socket \
+    safeai-web.service safeai-keep.socket >/dev/null 2>&1
+systemctl stop 'safeai-ask@*.service' 'safeai-web@*.service' 'safeai-keep@*.service' >/dev/null 2>&1
+rm -f /run/safeai-keep /run/safeai-keep.lock
+# the agent's web rule (safeai-web), and the state it left
+has "nft-table " && nft delete table inet safeai 2>/dev/null
+rm -f /run/safeai-web /run/safeai-web.lock
 # nothing of the agent may keep running while its traces are removed
 getent passwd "$AGENT" >/dev/null && pkill -KILL -u "$AGENT" 2>/dev/null
 # VS Code back to running Claude Code and Codex as you (also when it was switched on later, in safeai settings);
@@ -160,10 +165,14 @@ tac "$MANIFEST" | while read -r kind a b c; do
     case "$kind" in
         modified-file) [ -e "$b" ] && cp -a "$b" "$(tmp_of "$a")" && sync "$(tmp_of "$a")" && mv -f "$(tmp_of "$a")" "$a" ;;
         created-file) rm -f "$a" ;;
+        created-dir) rmdir "$a" 2>/dev/null ;;
         audit-log-dir) chgrp "$b" "$a" 2>/dev/null; chmod "$c" "$a" 2>/dev/null ;;
     esac
 done
 for d in /etc/systemd/system/user@*.service.d; do rmdir "$d" 2>/dev/null; done
+# the login screen as it was (an agent user kept is an ordinary user again)
+grep -q "^\(created\|modified\)-file /var/lib/AccountsService/users/" "$MANIFEST" &&
+    systemctl try-restart accounts-daemon.service >/dev/null 2>&1
 # Files keeps a removed extension loaded until it restarts
 if grep -q "^created-file .*/safeai_nautilus.py$" "$MANIFEST" && pgrep -u "$OWNER" -x nautilus >/dev/null; then
     u=$(id -u "$OWNER")
@@ -205,7 +214,7 @@ done
 if [ -n "$OWNER_HOME" ] && { [ -z "${SAFEAI_ROLLBACK:-}" ] || has "created-lists "; }; then
     if [ $KEEP_RULES = yes ] && [ -d "$OWNER_HOME/.config/safeai" ]; then  # the rules only, for the next install
         find "$OWNER_HOME/.config/safeai" -mindepth 1 -maxdepth 1 ! -name write-dirs ! -name read-only ! -name closed \
-            ! -name env-open ! -name mode -exec rm -rf {} +
+            ! -name env-open ! -name mode ! -name proxy -exec rm -rf {} +
         m u_kept_rules "$OWNER_HOME/.config/safeai"; echo
         # what it moved out of your projects stays with your rules
         if [ -n "$(find "$Q" -type f -print -quit 2>/dev/null)" ]; then m u_kept_quarantine "${Q/#"$OWNER_HOME"/$t}"; echo

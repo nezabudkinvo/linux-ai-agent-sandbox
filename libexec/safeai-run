@@ -27,7 +27,7 @@ for v in $(awk "BEGIN { for (k in ENVIRON) if (k ~ /^[A-Za-z_][A-Za-z0-9_]*\$/) 
         *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*CREDENTIAL*|*API_KEY*|*_KEY) unset "$v" ;;
         PATH|LANG|LANGUAGE|LC_*|TZ|TERM|COLORTERM|TERM_PROGRAM|TERM_PROGRAM_VERSION|NO_COLOR|FORCE_COLOR|COLUMNS|LINES|\
         EDITOR|VISUAL|PAGER|CLAUDE_*|CLAUDECODE|MCP_*|DISABLE_*|ENABLE_*|CODEX_*|RUST_LOG|\
-        SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE) ;;
+        SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|SAFEAI_CLAUDE_*) ;;
         http_proxy|https_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)
             eval "val=\${$v}"
             case "$val" in *@*) unset "$v" ;; esac ;;  # a proxy with a login stays yours

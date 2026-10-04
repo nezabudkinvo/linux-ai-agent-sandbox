@@ -9,6 +9,9 @@
 #   tests/vm.sh crash DISTRO   cut the power in the middle of an install, at a few points; after each,
 #                              the installer run again must finish (checks pass), or uninstall must
 #                              leave the VM as it was
+#   tests/vm.sh upgrade DISTRO [TAG]
+#                              a fresh VM with the last release (or TAG) installed and some rules set,
+#                              then this checkout as an update over it: the checks must pass
 #   tests/vm.sh ssh DISTRO [CMD...]
 #   tests/vm.sh down DISTRO    power off
 #   tests/vm.sh destroy DISTRO power off and delete the VM disk
@@ -85,6 +88,17 @@ case "$cmd" in
         "${SSH[@]}" 'mkdir -p ~/Projects/demo && rm -rf ~/src && mkdir ~/src'
         tar --exclude=.git --exclude=__pycache__ -cf - . | "${SSH[@]}" 'tar -xf - -C ~/src'
         "${SSH[@]}" "cd ~/src && sudo SAFEAI_MODE=${3:-strict} ./install.sh --yes && SAFEAI_TEST_VM=1 tests/check.sh"
+        ;;
+    upgrade)  # what users do: an update over the release they have
+        tag=${3:-$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' HEAD)}
+        stop; rm -rf "$VM"; up
+        git archive "$tag" | "${SSH[@]}" 'mkdir -p ~/old ~/Projects/demo/closed && tar -xf - -C ~/old'
+        "${SSH[@]}" "cd ~/old && sudo SAFEAI_MODE=relaxed ./install.sh --yes >/dev/null && \
+            safeai close ~/Projects/demo/closed >/dev/null && echo 'installed $tag'"
+        # the new copy in a folder the agent may only read, as the installer asks
+        tar --exclude=.git --exclude=__pycache__ -cf - . |
+            "${SSH[@]}" 'mkdir -p ~/src && safeai read ~/src >/dev/null && tar -xf - -C ~/src'
+        "${SSH[@]}" "cd ~/src && sudo ./install.sh --update >/dev/null && echo updated && SAFEAI_TEST_VM=1 tests/check.sh"
         ;;
     clean)  # install, use, uninstall on a fresh VM; then compare with the state before
         stop; rm -rf "$VM"; up

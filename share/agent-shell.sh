@@ -23,8 +23,54 @@ _safeai_in_home() {
     printf '%s: start it in a project folder (cd ~/Projects/...), not in the home folder itself:\n' "$1" >&2
     printf '  there it would take the owner'"'"'s own settings for the project'"'"'s\n' >&2
 }
-claude() { _safeai_in_home claude && return 1; command claude "$@"; }
-codex() { _safeai_in_home codex && return 1; command codex "$@"; }
+# The owner's network settings (safeai settings: proxy), put here by safeai when it starts this shell: the
+# proxy variables are in the environment of everything here; Claude also gets them as --settings, above the
+# agent's own and the project's settings, so neither sends it around the proxy. A proxy of this machine that
+# does not answer stops claude and codex: they would only wait. (The kernel lets the agent's web through
+# that proxy only, whatever runs here; see safeai-web.)
+_safeai_net() {  # _safeai_net NAME ARGS... - may NAME start now
+    local name=$1 a hp
+    shift
+    if [ -n "${SAFEAI_CLAUDE_STOP:-}" ]; then
+        printf 'safeai: agent %s is not started: %s\n' "$name" "$SAFEAI_CLAUDE_STOP" >&2
+        return 1
+    fi
+    if [ "$name" = Claude ]; then
+        for a in "$@"; do
+            case "$a" in --settings|--settings=*)
+                printf 'safeai: agent Claude is not started: --settings cannot be combined with the network settings safeai gives agent Claude\n' >&2
+                return 1 ;;
+            esac
+        done
+    fi
+    for hp in ${SAFEAI_CLAUDE_PROXIES:-}; do
+        # a free proxy port of this machine taken by this user (on any address) would send everything around it
+        case "${hp%:*}" in 127.*|localhost|::1) local here=1 ;; *) local here= ;; esac
+        if [ -n "$here" ] && awk -v p="$(printf '%04X' "${hp##*:}")" -v u="$(id -u)" 'FNR > 1 && $4 == "0A" && $8 == u &&
+                substr($2, length($2) - 3) == p { f = 1 } END { exit !f }' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            printf 'safeai: agent %s is not started: your proxy port %s is held by %s, not by your proxy app\n' \
+                "$name" "$hp" "$(id -un)" >&2
+            return 1
+        fi
+        timeout 2 bash -c 'h=${1%:*}; h=${h#[}; : <"/dev/tcp/${h%]}/${1##*:}"' _ "$hp" 2>/dev/null && continue
+        printf 'safeai: agent %s is not started: your proxy %s does not answer (is your proxy app running?)\n' "$name" "$hp" >&2
+        return 1
+    done
+}
+claude() {
+    _safeai_in_home claude && return 1
+    if [ -z "${SAFEAI_CLAUDE_SETTINGS:-}${SAFEAI_CLAUDE_STOP:-}" ]; then
+        command claude "$@"
+        return
+    fi
+    _safeai_net Claude "$@" || return 1
+    command claude "$@" --settings "$SAFEAI_CLAUDE_SETTINGS"
+}
+codex() {
+    _safeai_in_home codex && return 1
+    _safeai_net Codex "$@" || return 1
+    command codex "$@"
+}
 gemini() { _safeai_in_home gemini && return 1; command gemini "$@"; }
 if declare -F command_not_found_handle >/dev/null; then
     eval "_safeai_cnf_before () $(declare -f command_not_found_handle | tail -n +2)"

@@ -1,0 +1,136 @@
+#!/usr/bin/python3 -I
+"""safeai-web - the agent's web traffic only through the owner's local proxy (root, network rules only).
+
+When the owner has a proxy on this machine (safeai settings: proxy), `safeai` writes "on" to
+~/.config/safeai/web and asks this service to apply it: the kernel then lets the agent user reach
+ports 80 and 443 (TCP, and UDP 443 for QUIC) only on loopback, that is through the proxy. Claude, Codex
+and every other agent program cannot reach their servers around the proxy by mistake; ssh and other
+ports work as usual. "off", or no file at all, removes the rule. "on IP:PORT ..." names proxies on other
+machines: the agent may reach those on the web ports too.
+
+The file is only read: "on" and "off" are the only answers. Anything else (a link, another owner,
+other content, a read error) leaves the rule as it is and reports the failure: a broken choice never
+turns the rule off. A request on the socket carries nothing: it only applies the owner's choice again.
+Runs one at a time (a lock), at boot (safeai-web.service) and on request (safeai-web.socket, one line
+back: on, off or "failed: why"). The state applied is in /run/safeai-web, for safeai to check.
+
+    safeai-web    apply the owner's choice, print the state
+"""
+import errno
+import fcntl
+import ipaddress
+import os
+import pwd
+import stat
+import subprocess
+import sys
+import tempfile
+
+STATE = "/run/safeai-web"
+LOCK = "/run/safeai-web.lock"
+TABLE = "inet safeai"
+
+
+def system_conf(key, default=None):
+    try:
+        with open("/etc/safeai.conf") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == key and v:
+                    return v
+    except OSError:
+        pass
+    return default
+
+
+AWAY_MAX = 8
+
+
+def away(token):
+    """IP:PORT or [IPv6]:PORT of a proxy elsewhere, as (address, port); ValueError otherwise."""
+    host, sep, port = token.rpartition(":")
+    if not sep or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(token)
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    a = ipaddress.ip_address(host)
+    if a.is_loopback or a.is_unspecified or a.is_multicast:
+        raise ValueError(token)
+    return a, int(port)
+
+
+def wanted(owner):
+    """False (off, or no choice made), a list (on: the proxies elsewhere the agent may reach on the web
+    ports too), or a string: why the choice cannot be read."""
+    try:
+        fd = os.open(f"{owner.pw_dir}/.config/safeai/web", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        return "the choice cannot be read (" + ("a link" if e.errno == errno.ELOOP else e.strerror) + ")"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != owner.pw_uid:
+            return "the choice is not a file of the owner's"
+        choice = os.read(fd, 1024).decode("ascii", "replace").split()
+    except OSError as e:
+        return f"the choice cannot be read ({e.strerror})"
+    finally:
+        os.close(fd)
+    if choice == ["off"]:
+        return False
+    if not choice or choice[0] != "on" or len(choice) > 1 + AWAY_MAX:
+        return "the choice is neither on nor off"
+    try:
+        return [away(t) for t in choice[1:]]
+    except ValueError as e:
+        return f"the choice names no proxy address: {e}"
+
+
+def save(state):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".safeai-web.")
+    with os.fdopen(fd, "w") as f:
+        f.write(state + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE)
+
+
+def main():
+    owner = pwd.getpwnam(system_conf("OWNER") or sys.exit("OWNER missing in /etc/safeai.conf"))
+    agent = pwd.getpwnam(system_conf("AGENT", "aiagent")).pw_uid
+    with open(LOCK, "a") as lock:  # one at a time: read the choice, apply it, record it
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        on = wanted(owner)
+        if isinstance(on, str):  # the rule stays as it is
+            state = f"failed: {on}"
+        else:
+            # created first, so that deleting never fails; then the new rules, all in one transaction
+            rules = f"table {TABLE}\ndelete table {TABLE}\n"
+            if on is not False:
+                accept = "".join(f"\n        meta skuid {agent} {'ip' if a.version == 4 else 'ip6'} daddr {a} tcp dport {p} accept"
+                                 for a, p in on)  # your proxy elsewhere, also when it listens on a web port
+                rules += f"""table {TABLE} {{
+    chain out {{
+        type filter hook output priority filter; policy accept;{accept}
+        meta skuid {agent} oifname != "lo" tcp dport {{ 80, 443 }} counter reject with tcp reset
+        meta skuid {agent} oifname != "lo" udp dport 443 counter reject
+    }}
+}}
+"""
+            try:
+                r = subprocess.run(["nft", "-f", "-"], input=rules, capture_output=True, text=True)
+                why = (r.stderr.strip().splitlines() or ["nft failed"])[-1] if r.returncode else ""
+            except OSError:  # no nft: no rule of ours can be there either
+                why = "nft is missing (package nftables)" if on is not False else ""
+            # as safeai writes the choice: the owner's side compares the two
+            shown = " ".join(["on", *(f"[{a}]:{p}" if a.version == 6 else f"{a}:{p}" for a, p in on)]) if on is not False else "off"
+            state = f"failed: {why}" if why else shown
+        save(state)
+    print(state)
+    # the state says it all (here, in /run/safeai-web, in safeai status): a failed unit left behind in
+    # systemctl --failed would only be noise
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

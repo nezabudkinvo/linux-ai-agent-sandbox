@@ -100,9 +100,12 @@ declare -A MSG=(
   /etc/sudoers.d/safeai          %s may run programs as %s; nothing the other way
   /etc/safeai.conf, /usr/local/bin/safeai (with Tab completion), %s/
   services safeai-guard (root), safeai-check.timer (as %s, every 5 minutes),
-  safeai-ask.socket (the agent may ask you for access; the question shows on your screen)"
+  safeai-ask.socket (the agent may ask you for access; the question shows on your screen),
+  safeai-web (root, network rules only: when you set a proxy, the agent's web traffic
+  goes only through it; nftables table inet safeai)"
     [plan_lists]="  your lists in %s (secret stores like ~/.ssh closed in both modes)"
-    [plan_apparmor]="  AppArmor profile /etc/apparmor.d/safeai-agent; login shell of %s -> %s/safeai-shell;
+    [plan_apparmor]="  AppArmor profile /etc/apparmor.d/safeai-agent (and its rules from your lists in
+  /etc/apparmor.d/local/safeai-keep, by the service safeai-keep); login shell of %s -> %s/safeai-shell;
   %s added to /etc/cron.deny and /etc/at.deny (backed up)"
     [plan_audit]="  audit rules /etc/audit/rules.d/50-safeai.rules;
   /etc/audit/auditd.conf: log_group -> %s (backed up)"
@@ -111,13 +114,14 @@ declare -A MSG=(
   ACL entries for %s on your files (only that user's entries; removed on uninstall)"
     [plan_agent]="As %s: safeai's notes for it (~/.claude/safeai.md, imported by its CLAUDE.md; a part of
   ~/.codex/AGENTS.md - its own instructions stay), a Claude Code hook that
-  explains refusals to it, git trust for your
+  explains refusals to it; its Claude takes the proxy from your Claude settings at every start;
+  git trust for your
   repositories and your git name and e-mail for its commits"
     [plan_vscode]="  VS Code settings.json: two settings (their old values kept in settings.json.safeai-keys)"
     [plan_nautilus]="  ~/.local/share/nautilus-python/extensions/safeai_nautilus.py, its emblems in
   ~/.local/share/icons/hicolor/scalable/emblems;
   Files restarts to load it (its open windows close)"
-    [plan_untouched]="Does not change: network settings, other users, your groups or login, other services."
+    [plan_untouched]="Does not change: your network settings (only the agent's web, when you set a proxy), other users, your groups or login, other services."
     [plan_undo]="All of it can be undone at any time: sudo %s/uninstall.sh puts everything back as it was."
     [agent_mark]="[safeai: agent chat, limited access]"
     [plan_brief]="Agent user %s: no password, no sudo, none of your groups.
@@ -145,9 +149,14 @@ Your files: %s; ACL entries, a guard service and a check every 5 minutes keep it
     [err_auditgroup]="group %s has other members who would read the audit log; re-run and answer n for it"
     [err_audit]="safeai's audit rules did not load (auditctl -l does not show them); re-run and answer n for the audit log"
     [restart_files]="Files restarted to load the extension"
+    [keep_failed]="What you closed or made read-only is not kept from deletion by the agent (%s).
+Look at: journalctl -u 'safeai-keep@*'; then: safeai check --fix"
+    [web_failed]="The rule for the agent's web is not in place (%s): the agent does not start until it is.
+Look at: journalctl -u safeai-web.service; then: safeai check --fix"
     [done]="Start the agent in a project folder: safeai claude (or safeai for its terminal).
 Access: safeai open | read | close PATH. State: safeai status. Settings: safeai settings.
-Help: safeai --help. Check: %s/check.sh. Remove: sudo %s/uninstall.sh"
+Help: safeai --help. Full self-test (temporarily creates test files; about a minute): %s/check.sh.
+Remove: sudo %s/uninstall.sh"
 )
 m() {  # m KEY [ARGS...] - the message, formatted
     local key=$1; shift
@@ -157,13 +166,17 @@ m() {  # m KEY [ARGS...] - the message, formatted
 tty_ok() { (: </dev/tty) 2>/dev/null; }  # a terminal to ask in (not when piped or in CI)
 LANG_CHOICE=${GIVEN[LANG]:-${SAFEAI_LANG:-$(saved LANG)}}
 if [ -z "$LANG_CHOICE" ] && { [ "$MODE_ARG" = "" ] || [ "$MODE_ARG" = --plan ]; } && tty_ok; then
-    read -r -p "Language (en/ru) [en]: " LANG_CHOICE </dev/tty || true
+    while :; do
+        read -r -p "Language (en/ru) [en]: " LANG_CHOICE </dev/tty || { LANG_CHOICE=en; break; }
+        case "${LANG_CHOICE:-en}" in en|ru) break ;; *) echo "Answer en or ru." >/dev/tty ;; esac
+    done
 fi
+case "${LANG_CHOICE:-en}" in en|ru) ;; *) echo "bad language: $LANG_CHOICE (use en or ru)" >&2; exit 1 ;; esac
 # shellcheck source=share/i18n/ru
 [ "${LANG_CHOICE:-en}" = ru ] && . "$SRC/share/i18n/ru"
 [ -z "$EARLY" ] || { m "$EARLY" "$MODE_ARG" >&2; echo >&2; exit 1; }
 # every file this installs: a copy with one missing would stop half way
-for f in bin/safeai libexec/safeai-guard libexec/safeai-run libexec/safeai-codex libexec/safeai-shell \
+for f in bin/safeai libexec/safeai-guard libexec/safeai-web libexec/safeai-keep libexec/safeai-run libexec/safeai-codex libexec/safeai-shell \
          libexec/safeai-acl-clean libexec/safeai-explain libexec/safeai-owner-mark uninstall.sh tests/check.sh VERSION \
          share/i18n/ru share/agent-shell.sh share/agent-about.md share/allowed_signers share/bash-completion/safeai \
          share/apparmor/safeai-agent.in share/nautilus/safeai_nautilus.py share/nautilus/emblems/safeai-closed.svg \
@@ -189,6 +202,17 @@ rollback() {
             esac
             rm -f "$f"
         done
+        systemctl stop 'safeai-keep@*.service' 'safeai-web@*.service' >/dev/null 2>&1  # none left writing
+        if ! grep -q "^created-file /etc/systemd/system/safeai-keep.socket" "$UPD/manifest"; then
+            rm -f /run/safeai-keep /run/safeai-keep.lock
+        fi
+        if grep -q "^nft-table " "$MANIFEST" && ! grep -q "^nft-table " "$UPD/manifest"; then
+            systemctl stop 'safeai-web@*.service' >/dev/null 2>&1
+            nft delete table inet safeai >/dev/null 2>&1
+            rm -f /run/safeai-web /run/safeai-web.lock
+        fi
+        comm -13 <(sort "$UPD/manifest") <(sort "$MANIFEST") | sed -n 's/^created-dir //p' | sort -r |
+            while read -r f; do rmdir "$f" 2>/dev/null; done
         cp "$UPD/manifest" "$MANIFEST"
         find "$LIB" -mindepth 1 -delete 2>/dev/null
         tar -C / -xpf "$UPD/files.tar"
@@ -334,6 +358,7 @@ if [ "$MODE_ARG" != --apply ] && [ -z "${SAFEAI_SHIELDED:-}" ]; then
 # the packages that are missing, by the names this system uses
 need=()
 command -v setfacl >/dev/null || need+=(acl)
+PATH=$PATH:/usr/sbin:/sbin command -v nft >/dev/null || need+=(nftables)  # the agent's web through your proxy
 if [ $AUDIT = yes ] && ! command -v auditctl >/dev/null; then
     case $PKG in apt) need+=(auditd) ;; *) need+=(audit) ;; esac
 fi
@@ -480,10 +505,11 @@ rm -f "$probe"
 if ! getent passwd "$AGENT" >/dev/null; then
     # its group, left by a run of safeai cut off between creating the group and the user
     if getent group "$AGENT" >/dev/null && grep -qx "created-user $AGENT" "$MANIFEST"; then groupdel "$AGENT"; fi
-    # written down first: a user that a power cut leaves behind is still safeai's, and so is its home
+    # written down first: a user that a power cut leaves behind is still safeai's, and so is its home.
+    # NEW_USER before that: Ctrl+C from here on reverts the user (or what of it there is), and the record
+    NEW_USER=yes
     note "created-user $AGENT"
     [ -e "/home/$AGENT" ] || note "agent-home /home/$AGENT"
-    NEW_USER=yes  # before: Ctrl+C right after useradd reverts it too
     useradd -m -d "/home/$AGENT" -U -s /bin/bash "$AGENT"
     sync -f "/home/$AGENT"  # its shell files on disk now: a power cut must not leave them empty
 elif [ $ADOPT = yes ]; then
@@ -493,6 +519,17 @@ usermod -p '*' "$AGENT"
 AGENT_HOME=$(getent passwd "$AGENT" | cut -d: -f6)
 chmod 750 "$AGENT_HOME"
 if id -nG "$AGENT" | tr ' ' '\n' | grep -qvx "$AGENT"; then die "$(m err_groups "$AGENT")"; fi
+# the login screen lists people, not the agent: AccountsService (GDM, LightDM, GNOME Settings) is told it
+# is a system account. It has no password ('*' above), so it could not log in there anyway.
+acc=/var/lib/AccountsService/users/$AGENT
+if [ -d "$(dirname "$acc")" ]; then
+    backup "$acc"
+    { [ ! -f "$acc" ] || cat "$acc"; } | awk 'BEGIN { done = 0 }
+        /^SystemAccount=/ { next }
+        { print } /^\[User\]$/ && !done { print "SystemAccount=true"; done = 1 }
+        END { if (!done) { print "[User]"; print "SystemAccount=true" } }' | whole "$acc" 600
+    systemctl try-restart accounts-daemon.service >/dev/null 2>&1 || true  # it reads the file at start
+fi
 # the agent must not be able to change what root is about to run
 if [ -n "$(runuser -u "$AGENT" -- find "$SRC" -writable -print -quit 2>/dev/null)" ]; then
     die "$(m err_writable "$SRC" "$AGENT")"
@@ -514,7 +551,7 @@ rm -f "$tmp"
 [ -d "$LIB" ] || note "created-dir $LIB"
 install -d -m 755 "$LIB"
 put "$SRC/bin/safeai" /usr/local/bin/safeai 755
-for f in safeai-guard safeai-run safeai-codex safeai-shell safeai-acl-clean safeai-explain safeai-owner-mark; do put "$SRC/libexec/$f" "$LIB/$f" 755; done
+for f in safeai-guard safeai-web safeai-keep safeai-run safeai-codex safeai-shell safeai-acl-clean safeai-explain safeai-owner-mark; do put "$SRC/libexec/$f" "$LIB/$f" 755; done
 # so the checkout can be deleted: removal and the checks live next to the program
 put "$SRC/uninstall.sh" "$LIB/uninstall.sh" 755
 put "$SRC/share/i18n/ru" "$LIB/i18n-ru" 644  # uninstall.sh speaks the language chosen here
@@ -541,19 +578,22 @@ m applying; echo  # a home with millions of files takes a while: say so before t
 # your umask, kept with your lists: whether a file others may not read is private on purpose (with
 # 077 every file is, so the mode says nothing; see mode_private in bin/safeai)
 as_owner sh -c 'mkdir -p "$0" && chmod 700 "$0" && umask >"$0/umask"' "$CONF"
+# safeai-keep is not set up yet at this point (an update from a version without it): the rules from
+# your lists are asked for once, after the AppArmor profile (SAFEAI_INSTALLING)
 if [ $FIRST = yes ]; then
-    as_owner /usr/local/bin/safeai init "$HOME_MODE"
+    as_owner env SAFEAI_INSTALLING=1 /usr/local/bin/safeai init "$HOME_MODE"
     # this checkout: the agent must not change what the next "sudo ./install.sh" runs
-    case "$SRC/" in "$OWNER_HOME"/*) as_owner /usr/local/bin/safeai read "$SRC" >/dev/null ;; esac
+    case "$SRC/" in "$OWNER_HOME"/*) as_owner env SAFEAI_INSTALLING=1 /usr/local/bin/safeai read "$SRC" >/dev/null ;; esac
 else
-    as_owner /usr/local/bin/safeai setup
+    as_owner env SAFEAI_INSTALLING=1 /usr/local/bin/safeai setup
 fi
 if [ "$MODE_ARG" != --update ]; then  # the copy installed from: uninstall.sh offers to delete it
     sed -i '/^source-dir /d' "$MANIFEST"
     case "$SRC/" in "$OWNER_HOME"/?*/) note "source-dir $SRC" ;; esac
 fi
 
-for u in safeai-guard.service safeai-check.service safeai-check.timer safeai-ask.socket safeai-ask@.service; do
+for u in safeai-guard.service safeai-check.service safeai-check.timer safeai-ask.socket safeai-ask@.service \
+         safeai-web.service safeai-web.socket safeai-web@.service safeai-keep.socket safeai-keep@.service; do
     [ -e "/etc/systemd/system/$u" ] || note "created-file /etc/systemd/system/$u"
 done
 whole /etc/systemd/system/safeai-guard.service <<EOF
@@ -621,9 +661,105 @@ StandardOutput=socket
 StandardError=journal
 RuntimeMaxSec=300
 EOF
+# the agent's web only through your proxy (safeai settings: proxy): at boot, and when safeai asks
+command -v nft >/dev/null || pkg_install nftables
+WEB_LIMITS="CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+MemoryMax=64M"
+whole /etc/systemd/system/safeai-web.service <<EOF
+[Unit]
+Description=safeai: the agent's web only through your proxy, when you set one
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=$LIB/safeai-web
+$WEB_LIMITS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+whole /etc/systemd/system/safeai-web.socket <<EOF
+[Unit]
+Description=safeai: apply your proxy setting for the agent's web
+
+[Socket]
+ListenStream=/run/safeai-web.sock
+SocketUser=root
+SocketGroup=$OWNER_GROUP
+SocketMode=0660
+RemoveOnStop=yes
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
+EOF
+whole /etc/systemd/system/safeai-web@.service <<EOF
+[Unit]
+Description=safeai: apply your proxy setting for the agent's web
+
+[Service]
+ExecStart=$LIB/safeai-web
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=30
+$WEB_LIMITS
+EOF
+# what you closed or made read-only stays where it is: AppArmor rules from your lists (safeai-keep)
+KEEP_LIMITS="CapabilityBoundingSet=CAP_MAC_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run /etc/apparmor.d/local
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=256M"
+whole /etc/systemd/system/safeai-keep.socket <<EOF
+[Unit]
+Description=safeai: what you closed or made read-only stays where it is
+
+[Socket]
+ListenStream=/run/safeai-keep.sock
+SocketUser=root
+SocketGroup=$OWNER_GROUP
+SocketMode=0660
+RemoveOnStop=yes
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
+EOF
+whole /etc/systemd/system/safeai-keep@.service <<EOF
+[Unit]
+Description=safeai: what you closed or made read-only stays where it is
+
+[Service]
+ExecStart=$LIB/safeai-keep
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=120
+$KEEP_LIMITS
+EOF
+note "nft-table inet safeai"
 systemctl daemon-reload
 systemctl enable --now safeai-check.timer >/dev/null 2>&1
 systemctl enable --now safeai-ask.socket >/dev/null 2>&1
+systemctl enable --now safeai-web.socket >/dev/null 2>&1
+systemctl enable --now safeai-keep.socket >/dev/null 2>&1
+systemctl enable safeai-web.service >/dev/null 2>&1
+systemctl restart safeai-web.service >/dev/null 2>&1 || true  # "failed: why" is in /run/safeai-web
+web=$(as_owner /usr/local/bin/safeai _web 2>/dev/null) || true  # your proxy setting counts from now, not from the first chat
+case "$web" in on|off) ;; *) m web_failed "${web:-safeai-web does not answer}" >&2; echo >&2 ;; esac
 systemctl enable safeai-guard.service >/dev/null 2>&1
 systemctl restart safeai-guard.service
 
@@ -634,10 +770,15 @@ if [ $APPARMOR = yes ]; then
     if [ -e /etc/apparmor.d/abi/4.0 ]; then abi=4.0 extra=$'  userns,\n  mqueue,\n  io_uring,'; fi
     backup /etc/apparmor.d/safeai-agent
     note "apparmor safeai-agent"
+    # the rules safeai-keep writes from your lists, included by the profile
+    [ -d /etc/apparmor.d/local ] || { note "created-dir /etc/apparmor.d/local"; mkdir -p /etc/apparmor.d/local; }
+    backup /etc/apparmor.d/local/safeai-keep  # put back as it was on uninstall, if it was there
     sed -e "s|@ABI@|$abi|" -e "s|@OWNERHOME@|$OWNER_HOME|" "$SRC/share/apparmor/safeai-agent.in" |
         awk -v extra="$extra" '{ if ($0 == "  @EXTRA@") { if (extra != "") print extra } else print }' |
         whole /etc/apparmor.d/safeai-agent
     apparmor_parser -r /etc/apparmor.d/safeai-agent
+    keep=$(as_owner /usr/local/bin/safeai _keep 2>/dev/null) || true  # your lists, as rules: at once
+    case "$keep" in on*|off) ;; *) m keep_failed "${keep:-safeai-keep does not answer}" >&2; echo >&2 ;; esac
     backup /etc/shells
     grep -qx "$LIB/safeai-shell" /etc/shells || { cat /etc/shells; echo "$LIB/safeai-shell"; } | whole /etc/shells
     sh_was=$(getent passwd "$AGENT" | cut -d: -f7)
